@@ -67,6 +67,22 @@ if (config.runtimeTarget !== "cdp") {
 console.log("─".repeat(50));
 
 if (config.runtimeTarget !== "qq_ws") {
-  require("./wmpf/src/index.js");
+  try {
+    require("./wmpf/src/index.js");
+  } catch (e) {
+    const err = e instanceof Error ? e : new Error(String(e));
+    console.warn(`[启动] wmpf 模块加载失败，降级到纯 CDP 模式: ${err.message}`);
+  }
 }
-require("./src/index.js");
+
+try {
+  require("./src/index.js");
+} catch (e) {
+  const err = e instanceof Error ? e : new Error(String(e));
+  console.error(`[启动] 网关启动失败: ${err.message}`);
+  if (err.message.includes("EADDRINUSE")) {
+    console.error(`[启动] 端口 ${config.gatewayPort} 已被占用，请更换端口（--gateway-port PORT）或关闭占用进程`);
+  }
+  if (err.stack) console.error(err.stack);
+  process.exit(1);
+}

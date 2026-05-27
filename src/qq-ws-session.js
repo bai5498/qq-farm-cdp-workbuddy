@@ -2,10 +2,7 @@
 
 const { EventEmitter } = require("node:events");
 const WebSocket = require("ws");
-
-function toErrorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
-}
+const { toErrorMessage } = require("./utils");
 
 class QqWsSession extends EventEmitter {
   /**
@@ -25,7 +22,7 @@ class QqWsSession extends EventEmitter {
     this.callSeq = 0;
     /** @type {Map<string, any>} */
     this.clients = new Map();
-    /** @type {Map<string, { clientId: string, timer: NodeJS.Timeout, resolve: (value: any) => void, reject: (error: Error) => void }>} */
+    /** @type {Map<string, { clientId: string, timer: NodeJS.Timeout, resolve: (value: any) => void, reject: (error: Error) => void, _originalPayload?: any, retryOnDisconnect?: boolean }>} */
     this.pendingCalls = new Map();
     /** @type {Array<{ resolve: (client: any) => void, reject: (error: Error) => void, timer: NodeJS.Timeout }>} */
     this.readyWaiters = [];
@@ -148,6 +145,8 @@ class QqWsSession extends EventEmitter {
       },
     };
 
+    const retryOnDisconnect = opts.retryOnDisconnect !== false;
+
     return await new Promise((resolve, reject) => {
       const timeout = Math.max(1000, Number(opts.timeoutMs) || this.callTimeoutMs);
       const timer = setTimeout(() => {
@@ -160,6 +159,8 @@ class QqWsSession extends EventEmitter {
         timer,
         resolve,
         reject,
+        _originalPayload: packet.payload,
+        retryOnDisconnect,
       });
 
       try {
@@ -218,7 +219,7 @@ class QqWsSession extends EventEmitter {
       time: new Date().toISOString(),
       kind,
       clientId: clientId || null,
-      payload: payload || null,
+      payload: payload ?? null,
     };
     this.history.push(entry);
     if (this.history.length > this.maxHistory) {
@@ -303,12 +304,39 @@ class QqWsSession extends EventEmitter {
     if (this.activeClientId === client.id) {
       this.activeClientId = null;
     }
+
+    // 尝试将断线客户端的 pending calls 转发到其他活跃客户端
+    const activeClient = this._getActiveReadyClient();
     for (const [id, pending] of this.pendingCalls.entries()) {
       if (pending.clientId !== client.id) continue;
-      clearTimeout(pending.timer);
-      pending.reject(new Error("qq ws client disconnected"));
-      this.pendingCalls.delete(id);
+
+      if (activeClient) {
+        // 转发到新客户端
+        pending.clientId = activeClient.id;
+        try {
+          activeClient.socket.send(JSON.stringify({
+            id: id,
+            type: "call",
+            ts: Date.now(),
+            payload: pending._originalPayload || {},
+          }));
+        } catch (error) {
+          clearTimeout(pending.timer);
+          this.pendingCalls.delete(id);
+          pending.reject(new Error("qq ws call forward failed: " + toErrorMessage(error)));
+        }
+      } else if (pending.retryOnDisconnect) {
+        // 没有其他客户端但允许重试，等待新客户端连接后自动重发
+        // clientId 置空，在 _resolveReadyWaiters 触发时重发
+        pending.clientId = null;
+      } else {
+        // 没有其他客户端且不允许重试，直接 reject
+        clearTimeout(pending.timer);
+        this.pendingCalls.delete(id);
+        pending.reject(new Error("qq ws client disconnected"));
+      }
     }
+
     this._pushHistory("disconnect", client.id, null);
     this.emit("clientDisconnected", this.getStatusSnapshot(), client);
   }
@@ -319,11 +347,17 @@ class QqWsSession extends EventEmitter {
       const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
       packet = JSON.parse(text);
     } catch (error) {
+      const rawLength = Buffer.isBuffer(raw) ? raw.length : (raw ? String(raw).length : 0);
       this.lastError = {
         time: new Date().toISOString(),
         clientId: client.id,
         error: "invalid_json: " + toErrorMessage(error),
+        rawLength,
       };
+      this._pushHistory("invalidJson", client.id, {
+        error: toErrorMessage(error),
+        rawLength,
+      });
       return;
     }
 
@@ -351,6 +385,8 @@ class QqWsSession extends EventEmitter {
       });
       this.emit("hello", this.getStatusSnapshot(), client);
       this._resolveReadyWaiters();
+      // 新客户端 ready 后，重发 clientId 为 null 的 pending calls
+      this._retryOrphanedPendingCalls();
       return;
     }
 
@@ -358,15 +394,17 @@ class QqWsSession extends EventEmitter {
       this.lastEvent = {
         time: new Date().toISOString(),
         clientId: client.id,
-        payload: packet.payload || null,
+        payload: packet.payload ?? null,
       };
-      this._pushHistory("event", client.id, packet.payload || null);
+      this._pushHistory("event", client.id, packet.payload ?? null);
       if (packet.payload && packet.payload.name === "gameCtlReadyChanged") {
         client.ready = !!packet.payload.ready;
         if (client.ready) {
           this.activeClientId = client.id;
           this._resolveReadyWaiters();
+          this._retryOrphanedPendingCalls();
         }
+        this.emit("gameCtlReadyChanged", this.getStatusSnapshot(), client);
       }
       this.emit("event", this.lastEvent, client);
       return;
@@ -376,9 +414,9 @@ class QqWsSession extends EventEmitter {
       this.lastLog = {
         time: new Date().toISOString(),
         clientId: client.id,
-        payload: packet.payload || null,
+        payload: packet.payload ?? null,
       };
-      this._pushHistory("log", client.id, packet.payload || null);
+      this._pushHistory("log", client.id, packet.payload ?? null);
       this.emit("log", this.lastLog, client);
       return;
     }
@@ -412,10 +450,37 @@ class QqWsSession extends EventEmitter {
         time: new Date().toISOString(),
         clientId: client.id,
         error: packet.payload && packet.payload.error ? packet.payload.error : "client_error",
-        payload: packet.payload || null,
+        payload: packet.payload ?? null,
       };
       this._pushHistory("clientError", client.id, this.lastError);
       this.emit("clientError", this.lastError, client);
+    }
+  }
+
+  /**
+   * 将 clientId 为 null（断线后等待重试）的 pending calls 转发到当前活跃客户端。
+   * 在新客户端 hello 或 gameCtlReadyChanged 时调用。
+   */
+  _retryOrphanedPendingCalls() {
+    const activeClient = this._getActiveReadyClient();
+    if (!activeClient) return;
+
+    for (const [id, pending] of this.pendingCalls.entries()) {
+      if (pending.clientId !== null) continue;
+
+      pending.clientId = activeClient.id;
+      try {
+        activeClient.socket.send(JSON.stringify({
+          id: id,
+          type: "call",
+          ts: Date.now(),
+          payload: pending._originalPayload || {},
+        }));
+      } catch (error) {
+        clearTimeout(pending.timer);
+        this.pendingCalls.delete(id);
+        pending.reject(new Error("qq ws call retry failed: " + toErrorMessage(error)));
+      }
     }
   }
 

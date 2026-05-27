@@ -43,3 +43,9 @@ WMPFDebugger/
 deobfuscated/
 总结.md
 .claude/settings.local.json
+
+# 临时探测/调试脚本
+check-*.js
+probe-*.js
+patch-*.js
+find-*.js

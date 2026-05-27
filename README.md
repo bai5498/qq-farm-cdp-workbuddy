@@ -1,4 +1,4 @@
-这是一个偏工程实验性质的项目。和“农场脚本”本身相比，更值得看的其实是两件事：
+这是一个偏工程实验性质的项目。和"农场脚本"本身相比，更值得看的其实是两件事：
 
 - 如何把非标准小游戏调试链路补成可用的 CDP / RPC
 - 如何把游戏内能力层、外部网关、网页控制台拆开
@@ -9,6 +9,14 @@
 - QQ 小程序本地资源环境：`WebSocket 宿主 + QQ bundle`
 
 hook 代码感谢 [evi0s/WMPFDebugger](https://github.com/evi0s/WMPFDebugger)
+
+> **⚠️ 原创声明**
+>
+> 本项目原始作者为 **[linguo2625469](https://github.com/linguo2625469)**，原始仓库地址：<https://github.com/linguo2625469/qq-farm-cdp-auto>
+>
+> 本 fork 仅在原项目基础上进行了 **Bug 修复和稳定性改进**，未改变项目核心架构和功能。所有原创设计、代码和文档的著作权归原作者所有。
+>
+> Bug 修复内容详见 [修复日志](#修复日志)。
 
 # 农场自动化控制台
 
@@ -231,3 +239,48 @@ npm run qq:patch
 ## 许可证
 
 本项目使用 [GNU GPL v3.0](LICENSE)。
+
+## 修复日志
+
+### 2026-05-27 Bug 修复（18 项）
+
+#### 🔴 Critical
+
+| Bug | 文件 | 描述 |
+|-----|------|------|
+| autoFarmPlantSource 传错参数 | auto-farm-manager.js | `normalizeAutoPlantSource(src.autoFarmPlantMode)` → `normalizeAutoPlantSource(src.autoFarmPlantSource, src.autoFarmPlantMode)`，种子来源配置此前永远不生效 |
+
+#### 🟠 High
+
+| Bug | 文件 | 描述 |
+|-----|------|------|
+| gameCtlReadyChanged 事件未 emit | qq-ws-session.js | 收到事件后只更新内部状态，未 `this.emit()`，导致 gateway 监听器为死代码（自动补丁、自动启动全部失效） |
+| toPositiveNumber(0) 返回 null | utils.js | `n > 0` 改为 `n >= 0`，landId=0 的地块此前被跳过 |
+| 模板字面量注入风险 | gateway.js / game-ctl-utils.js | 脚本内容含反引号或 `${}` 会破坏模板，改为字符串拼接 |
+
+#### 🟡 Medium
+
+| Bug | 文件 | 描述 |
+|-----|------|------|
+| 施肥 "all" 策略逻辑错误 | auto-farm-executor.js | 空地也被选中，移除 `|| grid.interactable === true` |
+| opts 运算符优先级 | auto-farm-executor.js | 加括号修正，fertilizeMinLevel 改用 `!= null` |
+| loadFarmConfig 竞态 | gateway.js | 保存 configLoadedPromise，start/runOnce 时 await |
+| CDP 双重重连冲突 | gateway.js | gateway 创建 CdpSession 时设 `reconnectEnabled: false` |
+| 错误被静默吞没 | cdp-wmpf-session.js | `catch(() => {})` → `catch(e => console.debug(...))` |
+
+#### 🟢 Low
+
+| Bug | 文件 | 描述 |
+|-----|------|------|
+| 魔术数字 | preview-manager.js | `1` → `WebSocket.OPEN` |
+| PNG quality 误传 | preview-manager.js | JPEG 时才传 quality 参数 |
+| 重复 toInt 函数 | preview-manager.js | 删除本地定义，改为 `require("./utils")` |
+| 重复 normalizeFriendStrategy | auto-farm-plant-config.js | 抽到共享模块，删除 executor+manager 重复定义 |
+| payload\|\|null | qq-ws-session.js | 改为 `??` 运算符，保留合法 falsy 值 |
+| 冗余 path.join | qq-bundle.js | `path.join(path.join(...))` → `path.join(...)` |
+| 冗余导出 | game-ctl-utils.js / qq-bundle.js | 移除未使用的 wrapCallExpression / sha1Hex / trimToString |
+
+#### Web UI 改进
+
+- 开始/停止自动化按钮颜色根据运行状态自动切换
+- 底部区域改为修复日志展示

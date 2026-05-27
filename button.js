@@ -5379,6 +5379,403 @@
     return await performBatchLandCareAction('eraseGrass', landIds, opts);
   }
 
+  // -------------------------------------------------------------------------
+  // Fertilize functions
+  // 施肥通过游戏内置 Protobuf + netWebSocket 直发
+  // 不走 dispatchEvent，因为游戏没有注册 REQUEST_FERTILIZE 事件监听
+  // -------------------------------------------------------------------------
+
+  /**
+   * 诊断施肥功能的运行时环境
+   * 返回 oops 对象的属性、protobuf 运行时查找结果等信息
+   */
+  function diagnoseFertilizeEnvironment() {
+    const result = { timestamp: Date.now() };
+
+    // 1. resolveOops
+    try {
+      const oops = resolveOops();
+      result.oopsFound = !!oops;
+      if (oops) {
+        result.oopsKeys = Object.keys(oops).sort();
+        // 检查关键属性
+        result.oopsHasProtobufDefault = 'protobufDefault' in oops;
+        result.oopsHasNetWebSocket = 'netWebSocket' in oops;
+        result.oopsHasMessage = 'message' in oops;
+        result.oopsHasItemM = 'itemM' in oops;
+        // 检查包含 proto/fert 关键词的属性
+        result.oopsProtoKeys = Object.keys(oops).filter(k =>
+          k.toLowerCase().includes('proto') || k.toLowerCase().includes('pb') ||
+          k.toLowerCase().includes('fert') || k.toLowerCase().includes('net') ||
+          k.toLowerCase().includes('ws') || k.toLowerCase().includes('socket')
+        );
+      }
+    } catch (e) {
+      result.oopsError = e.message || String(e);
+    }
+
+    // 2. 全局搜索 protobuf
+    result.globalProtoKeys = Object.keys(G).filter(k =>
+      k.toLowerCase().includes('protobuf') || k.toLowerCase().includes('pbjs')
+    ).slice(0, 20);
+
+    // 3. System modules 搜索
+    try {
+      const sys = G.System || G.cc && G.cc.sys;
+      result.systemFound = !!sys;
+    } catch (e) {}
+
+    // 4. 检查游戏的 NetNode / Network 模块
+    try {
+      const oops = resolveOops();
+      if (oops) {
+        const netRelated = {};
+        for (const key of Object.keys(oops)) {
+          const val = oops[key];
+          if (val && typeof val === 'object') {
+            const valKeys = Object.keys(val);
+            if (valKeys.some(vk => vk.toLowerCase().includes('send') || vk.toLowerCase().includes('request') || vk.toLowerCase().includes('ws'))) {
+              netRelated[key] = valKeys.slice(0, 15);
+            }
+          }
+        }
+        result.oopsNetRelated = netRelated;
+      }
+    } catch (e) {}
+
+    // 5. 直接测试 protobuf 查找
+    try {
+      const pbSearch = findSystemModuleExport(
+        ['chunks:///_virtual/protobuf.ts', 'chunks:///_virtual/Protobuf.ts',
+         'chunks:///_virtual/protobuf.min.js', './protobuf.ts'],
+        'protobufDefault'
+      );
+      result.protobufModuleSearch = pbSearch ? { found: true, moduleId: pbSearch.moduleId } : { found: false };
+    } catch (e) {
+      result.protobufModuleSearchError = e.message || String(e);
+    }
+
+    // 6. 查找 FertilizeRequest 相关的 System 模块
+    try {
+      const modules = getSystemModuleIds();
+      const fertModules = modules.filter(id =>
+        id.toLowerCase().includes('fert') || id.toLowerCase().includes('land')
+      );
+      result.fertilizeRelatedModules = fertModules.slice(0, 20);
+    } catch (e) {
+      result.fertilizeModuleSearchError = e.message || String(e);
+    }
+
+    return result;
+  }
+
+  async function fertilizeSingleLand(landId, fertilizerId, opts) {
+    opts = opts || {};
+    const targetLandId = toPositiveNumber(landId);
+    if (targetLandId == null) throw new Error('landId required');
+    const fertId = toPositiveNumber(fertilizerId) || 2;
+
+    const result = await fertilizeLands([targetLandId], fertId, opts);
+    if (result && result.results && result.results.length > 0) {
+      return result.results[0];
+    }
+    return result;
+  }
+
+  async function fertilizeLands(landIdsOrPayload, fertilizerId, opts) {
+    opts = opts || {};
+
+    // 支持两种调用方式：
+    // 1. fertilizeLands([1,2,3], 2, opts) - 分别传 landIds 和 fertilizerId
+    // 2. fertilizeLands({ land_ids: [1,2,3], fertilizer_id: 2 }, opts) - 传 payload 对象
+    let normalizedLandIds;
+    let fertId;
+    if (landIdsOrPayload && typeof landIdsOrPayload === 'object' && !Array.isArray(landIdsOrPayload)) {
+      normalizedLandIds = normalizeLandIds(landIdsOrPayload.land_ids || landIdsOrPayload.landIds);
+      fertId = toPositiveNumber(landIdsOrPayload.fertilizer_id || landIdsOrPayload.fertilizerId) || 2;
+      if (fertilizerId && typeof fertilizerId === 'object' && !Array.isArray(fertilizerId)) {
+        opts = fertilizerId;
+      }
+    } else {
+      normalizedLandIds = normalizeLandIds(landIdsOrPayload);
+      fertId = toPositiveNumber(fertilizerId) || 2;
+    }
+
+    if (normalizedLandIds.length === 0) {
+      return {
+        ok: false,
+        reason: 'land_ids_empty',
+        dispatched: false,
+        landIds: [],
+        fertilizerId: fertId
+      };
+    }
+
+    const payload = {
+      land_ids: normalizedLandIds.slice(),
+      fertilizer_id: fertId
+    };
+
+    // 施肥事件名（游戏原生用 REQUEST_FERTILIZE_LAND/REQUEST_FERTILIZE_LANDS）
+    const singleEvent = 'REQUEST_FERTILIZE_LAND';
+    const batchEvent = 'REQUEST_FERTILIZE_LANDS';
+    const completedEvent = 'FERTILIZE_PLANT_COMPLETED';
+    const eventName = normalizedLandIds.length === 1 ? singleEvent : batchEvent;
+
+    const message = getOopsMessage();
+
+    // 检测消息总线上是否有 FERTILIZE 事件监听器
+    // 游戏原始代码未注册 FERTILIZE 监听器（UI 中没有施肥按钮），
+    // dispatchEvent 会静默忽略，onComplete 永远不会被调用
+    let hasFertilizeListener = false;
+    try {
+      // 方法1：检查 _listeners 或 _eventMap
+      const listenerMap = message._listeners || message._eventMap || message._callbacks;
+      if (listenerMap) {
+        const allNames = [singleEvent, batchEvent, 'REQUEST_FERTILIZE', 'REQUEST_FERTILIZE_PLANT', 'REQUEST_FERTILIZE_PLANTS'];
+        for (const n of allNames) {
+          if (listenerMap[n] || listenerMap[n.toLowerCase()]) {
+            hasFertilizeListener = true;
+            break;
+          }
+        }
+      }
+      // 方法2：如果消息总线有 listenerCount 方法
+      if (!hasFertilizeListener && typeof message.listenerCount === 'function') {
+        const allNames = [singleEvent, batchEvent, 'REQUEST_FERTILIZE'];
+        for (const n of allNames) {
+          if (message.listenerCount(n) > 0) {
+            hasFertilizeListener = true;
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 如果没有 FERTILIZE 监听器，直接走 Protobuf 路径
+    if (!hasFertilizeListener) {
+      try {
+        const pbResult = await sendFertilizeViaProtobuf(normalizedLandIds, fertId, opts);
+        return {
+          ok: !!(pbResult && pbResult.ok),
+          reason: (pbResult && pbResult.reason) || 'protobuf_sent',
+          event: eventName,
+          request: payload,
+          dispatched: true,
+          method: 'protobuf',
+          landIds: normalizedLandIds,
+          fertilizerId: fertId,
+          ...(pbResult || {})
+        };
+      } catch (pbError) {
+        // Protobuf 也失败，回退到事件 dispatch（fire-and-forget）
+        try {
+          message.dispatchEvent(eventName, payload);
+          return {
+            ok: true,
+            reason: 'dispatched_no_listener_protobuf_failed',
+            event: eventName,
+            request: payload,
+            dispatched: true,
+            method: 'event_fire_and_forget',
+            pbError: pbError.message || String(pbError),
+            landIds: normalizedLandIds,
+            fertilizerId: fertId
+          };
+        } catch (e) {
+          return {
+            ok: false,
+            reason: 'all_methods_failed',
+            error: pbError.message + '; ' + (e.message || String(e)),
+            dispatched: false,
+            landIds: normalizedLandIds,
+            fertilizerId: fertId
+          };
+        }
+      }
+    }
+
+    // 有监听器，走正常事件 dispatch + onComplete 回调模式
+    if (opts.waitForResult === false) {
+      try {
+        message.dispatchEvent(eventName, payload);
+      } catch (e) {
+        const altNames = ['REQUEST_FERTILIZE', 'REQUEST_FERTILIZE_PLANT', 'REQUEST_FERTILIZE_PLANTS'];
+        for (const alt of altNames) {
+          try {
+            message.dispatchEvent(alt, payload);
+            return {
+              ok: true,
+              reason: 'dispatched_alt',
+              event: alt,
+              request: payload,
+              dispatched: true,
+              landIds: normalizedLandIds,
+              fertilizerId: fertId
+            };
+          } catch (_) {}
+        }
+      }
+      return {
+        ok: true,
+        reason: 'dispatched',
+        event: eventName,
+        request: payload,
+        dispatched: true,
+        landIds: normalizedLandIds,
+        fertilizerId: fertId
+      };
+    }
+
+    // 等待结果模式
+    const timeoutMs = opts.actionTimeoutMs == null
+      ? (opts.timeoutMs == null ? 2500 : Math.max(0, Number(opts.timeoutMs) || 0))
+      : Math.max(0, Number(opts.actionTimeoutMs) || 0);
+    const startedAt = Date.now();
+
+    return await new Promise(function (resolve) {
+      let settled = false;
+      let timer = null;
+
+      function finish(result) {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve({
+          ok: !!(result && result.ok),
+          reason: result && result.ok ? 'completed' : (result && result.reason) || 'unknown',
+          event: eventName,
+          request: payload,
+          dispatched: true,
+          elapsedMs: Date.now() - startedAt,
+          landIds: normalizedLandIds,
+          fertilizerId: fertId,
+          ...result
+        });
+      }
+
+      payload.onComplete = function (ok, errorCode) {
+        finish({
+          ok: !!ok,
+          reason: ok ? 'completed' : 'request_failed',
+          errorCode: Number.isFinite(Number(errorCode)) ? Number(errorCode) : null
+        });
+      };
+
+      try {
+        message.dispatchEvent(eventName, payload);
+      } catch (e) {
+        const altNames = ['REQUEST_FERTILIZE', 'REQUEST_FERTILIZE_PLANT', 'REQUEST_FERTILIZE_PLANTS'];
+        let dispatched = false;
+        for (const alt of altNames) {
+          try {
+            message.dispatchEvent(alt, payload);
+            dispatched = true;
+            break;
+          } catch (_) {}
+        }
+        if (!dispatched) {
+          finish({ ok: false, reason: 'dispatch_failed', error: e.message || String(e) });
+          return;
+        }
+      }
+
+      timer = setTimeout(function () {
+        finish({ ok: false, reason: 'timeout' });
+      }, timeoutMs);
+    });
+  }
+
+  /**
+   * 通过游戏内置 Protobuf + netWebSocket 直发施肥请求
+   * FertilizeRequest { land_ids: [], fertilizer_id: 2 }
+   */
+  async function sendFertilizeViaProtobuf(landIds, fertilizerId, opts) {
+    const diag = { step: 'init' };
+
+    // 1. 获取 Protobuf 运行时
+    let pb;
+    try {
+      diag.step = 'getProtobufDefault';
+      pb = getProtobufDefault();
+      diag.pbType = typeof pb;
+      diag.pbKeys = pb ? Object.keys(pb).slice(0, 20) : [];
+    } catch (e) {
+      diag.pbError = e.message || String(e);
+      throw new Error('getProtobufDefault failed: ' + diag.pbError);
+    }
+
+    // 2. 查找 FertilizeRequest 类型
+    diag.step = 'lookupFertilizeRequest';
+    const FertilizeRequest = pb.lookupType
+      ? pb.lookupType('FertilizeRequest')
+      : (pb.FertilizeRequest || null);
+
+    if (!FertilizeRequest) {
+      // FertilizeRequest 不存在 — 列出可用的 protobuf 类型供诊断
+      const availableTypes = pb.lookupType
+        ? 'lookupType exists, but FertilizeRequest not found'
+        : 'no lookupType method, pb.FertilizeRequest=' + String(pb.FertilizeRequest);
+      throw new Error('FertilizeRequest not found: ' + availableTypes + '; pb keys: ' + diag.pbKeys.join(','));
+    }
+
+    // 3. 构建并编码请求
+    diag.step = 'encodeFertilizeRequest';
+    const payload = {
+      land_ids: landIds.slice(),
+      fertilizer_id: fertilizerId || 2
+    };
+
+    const errMsg = FertilizeRequest.verify(payload);
+    if (errMsg) {
+      throw new Error('FertilizeRequest verify failed: ' + errMsg);
+    }
+
+    const reqMessage = FertilizeRequest.create(payload);
+    const encoded = FertilizeRequest.encode(reqMessage).finish();
+    diag.encodedSize = encoded.byteLength || encoded.length;
+
+    // 4. 通过游戏的 netWebSocket 发送
+    diag.step = 'sendViaNetWebSocket';
+    let netWs;
+    try {
+      netWs = getNetWebSocket();
+    } catch (e) {
+      diag.netWsError = e.message || String(e);
+    }
+    if (netWs && typeof netWs.send === 'function') {
+      netWs.send({ data: encoded });
+      return { ok: true, reason: 'netWebSocket_sent', diag };
+    }
+
+    // 5. 回退：通过 oops 消息总线发送
+    diag.step = 'sendViaOops';
+    let oops;
+    try {
+      oops = getOopsMessage();
+    } catch (e) {
+      diag.oopsError = e.message || String(e);
+    }
+    if (oops && typeof oops.sendProtobuf === 'function') {
+      oops.sendProtobuf(encoded);
+      return { ok: true, reason: 'oops_sendProtobuf', diag };
+    }
+
+    // 6. 回退：通过网络管理器发送
+    diag.step = 'sendViaNetworkManager';
+    const G = typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : {});
+    const netMgr = G.oops && G.oops.networkManager
+      ? G.oops.networkManager
+      : (G.GameGlobal && G.GameGlobal.networkManager ? G.GameGlobal.networkManager : null);
+
+    if (netMgr && typeof netMgr.send === 'function') {
+      netMgr.send(encoded);
+      return { ok: true, reason: 'networkManager_sent', diag };
+    }
+
+    throw new Error('no send mechanism available: netWs=' + (netWs ? 'exists_no_send' : diag.netWsError || 'null') + ', oops=' + (oops ? 'exists_no_sendProtobuf' : diag.oopsError || 'null') + ', netMgr=' + (netMgr ? 'exists_no_send' : 'null'));
+  }
+
   async function plantSingleLand(seedIdOrItemId, landId, opts) {
     opts = opts || {};
     const targetLandId = toPositiveNumber(landId);
@@ -6691,6 +7088,9 @@
     waterLands,
     killBugLands,
     eraseGrassLands,
+    fertilizeSingleLand,
+    fertilizeLands,
+    diagnoseFertilizeEnvironment,
     clickMatureEffect,
     plantSingleLand,
     plantSeedsOnLands,
@@ -6757,6 +7157,9 @@
       'gameCtl.waterLands(landIds, opts)',
       'gameCtl.killBugLands(landIds, opts)',
       'gameCtl.eraseGrassLands(landIds, opts)',
+      'gameCtl.fertilizeSingleLand(landId, fertilizerId, opts)',
+      'gameCtl.fertilizeLands(landIdsOrPayload, fertilizerId, opts)',
+      'gameCtl.diagnoseFertilizeEnvironment()',
       'gameCtl.clickMatureEffect(landId, opts)',
       'gameCtl.plantSingleLand(seedId, landId, opts)',
       'gameCtl.plantSeedsOnLands(seedId, landIds, opts)',

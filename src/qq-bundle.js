@@ -2,9 +2,9 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const crypto = require("node:crypto");
 const { QQ_RPC_HOST_METHODS } = require("./qq-rpc-spec");
 const { findLatestQqMiniappByAppId } = require("./qq-miniapp-discovery");
+const { sha1Hex, trimToString } = require("./utils");
 
 const MARKER_START = "// >>> QQ_FARM_AUTOMATION START >>>";
 const MARKER_END = "// <<< QQ_FARM_AUTOMATION END <<<";
@@ -16,14 +16,6 @@ function replaceAll(source, token, value) {
 
 function escapeDoubleQuotedString(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function sha1Hex(source) {
-  return crypto.createHash("sha1").update(source, "utf8").digest("hex");
-}
-
-function trimToString(value) {
-  return String(value == null ? "" : value).trim();
 }
 
 function normalizeWsUrl(rawUrl, config) {
@@ -113,7 +105,7 @@ function resolveQqPatchTarget(options = {}) {
 }
 
 function getQqBundleState(config) {
-  const outputPath = config.qqBundleOutPath || path.join(path.join(__dirname, ".."), "dist", DEFAULT_QQ_BUNDLE_FILENAME);
+  const outputPath = config.qqBundleOutPath || path.join(__dirname, "..", "dist", DEFAULT_QQ_BUNDLE_FILENAME);
   const target = resolveQqPatchTarget({
     targetPath: config.qqGameJsPath,
     appId: config.qqAppId,

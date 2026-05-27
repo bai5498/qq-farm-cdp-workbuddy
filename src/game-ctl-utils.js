@@ -1,24 +1,9 @@
 "use strict";
 
+const { wrapCallExpression } = require("./utils");
 const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const path = require("node:path");
-
-function wrapCallExpression(dotPath, args) {
-  const parts = String(dotPath || "").split(".").filter(Boolean);
-  if (parts.length === 0) throw new Error("call.path empty");
-  const jsonArgs = JSON.stringify(args ?? []);
-  return `(async () => {
-    const _path = ${JSON.stringify(parts)};
-    let cur = globalThis;
-    for (let i = 0; i < _path.length; i++) {
-      cur = cur[_path[i]];
-      if (cur == null) throw new Error('call path not found at: ' + _path.slice(0, i + 1).join('.'));
-    }
-    if (typeof cur !== 'function') throw new Error('call path is not a function: ' + _path.join('.'));
-    return await cur.apply(null, ${jsonArgs});
-  })()`;
-}
 
 function resolveButtonScriptPath(projectRoot) {
   return path.join(projectRoot, "button.js");
@@ -44,7 +29,7 @@ function validateSourcePayload(source) {
     "        wx." + _m + "({ title: " + JSON.stringify(_t) + ", icon: 'none', duration: 3000 });",
     "        _envLastTs = _n;",
     "      }",
-    "    } catch (_) {}",
+    "    } catch (_) { console.debug('[game-ctl-utils] validateSourcePayload skip:', _.message || String(_)); }",
     "  }",
   ].join("\n");
   const idx = source.indexOf("(() => {");
@@ -77,6 +62,7 @@ async function probeGameCtl(session, requiredMethods) {
   try {
     return await session.evaluate(expr, { awaitPromise: true });
   } catch (_) {
+    console.debug("[game-ctl-utils] probeGameCtl failed:", _.message || String(_));
     return null;
   }
 }
@@ -94,11 +80,7 @@ async function ensureGameCtl(session, projectRoot, requiredMethods = []) {
     return { injected: false, state };
   }
 
-  await session.evaluate(`(async () => { ${script}
-; if (globalThis.gameCtl && typeof globalThis.gameCtl === "object") {
-    globalThis.gameCtl.__scriptHash = ${JSON.stringify(scriptHash)};
-  }
-; return { injected: true, scriptHash: ${JSON.stringify(scriptHash)} }; })()`, {
+  await session.evaluate("(async () => { " + script + "\n; if (globalThis.gameCtl && typeof globalThis.gameCtl === \"object\") {\n    globalThis.gameCtl.__scriptHash = " + JSON.stringify(scriptHash) + ";\n  }\n; return { injected: true, scriptHash: " + JSON.stringify(scriptHash) + " }; })()", {
     awaitPromise: true,
   });
 
@@ -120,7 +102,6 @@ async function callGameCtl(session, pathName, args) {
 }
 
 module.exports = {
-  wrapCallExpression,
   resolveButtonScriptPath,
   readButtonScript,
   ensureGameCtl,

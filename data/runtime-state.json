@@ -1,0 +1,29 @@
+{
+  "running": true,
+  "lastOwnRunAt": 1779891948194,
+  "lastFriendRunAt": 1779891449554,
+  "careExpLimitState": null,
+  "config": {
+    "autoFarmOwnEnabled": true,
+    "autoFarmFriendEnabled": true,
+    "autoFarmOwnIntervalSec": 60,
+    "autoFarmFriendIntervalSec": 600,
+    "autoFarmMaxFriends": 5,
+    "autoFarmEnterWaitMs": 1800,
+    "autoFarmActionWaitMs": 1200,
+    "autoFarmRefreshFriendList": true,
+    "autoFarmReturnHome": true,
+    "autoFarmStopOnError": true,
+    "autoFarmStopCareWhenNoExp": false,
+    "autoFarmAutoStart": false,
+    "autoFarmFertilizeEnabled": false,
+    "autoFarmFertilizerType": "normal",
+    "autoFarmFertilizerId": 2,
+    "autoFarmFertilizeStrategy": "all",
+    "autoFarmFertilizeMinLevel": 0,
+    "autoFarmFriendStrategy": "steal_and_help",
+    "autoFarmPlantMode": "highest",
+    "autoFarmPlantSource": "backpack",
+    "autoFarmPlantSelectedSeedKey": "shop:56"
+  }
+}

@@ -3,10 +3,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-
-function trimToString(value) {
-  return String(value == null ? "" : value).trim();
-}
+const { trimToString } = require("./utils");
 
 function statSafe(targetPath) {
   try {

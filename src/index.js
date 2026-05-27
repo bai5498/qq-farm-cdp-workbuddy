@@ -19,7 +19,7 @@ if (config.runtimeTarget !== "qq_ws" && config.useWmpfCdpBridge !== false) {
   }
 }
 
-const { httpServer, close } = createGateway(config);
+const { httpServer, close, wss, autoFarmManager } = createGateway(config);
 
 httpServer.listen(config.gatewayPort, config.gatewayHost, () => {
   const host = config.gatewayHost;
@@ -45,12 +45,75 @@ httpServer.listen(config.gatewayPort, config.gatewayHost, () => {
   }
 });
 
+let isShuttingDown = false;
+
 function shutdown() {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log("[shutdown] 开始优雅关闭...");
+
+  // 如果 autoFarmManager 正在运行（busy），等待当前周期完成（最多 10 秒）
+  if (autoFarmManager && autoFarmManager.busy) {
+    const waitUntil = Date.now() + 10_000;
+    const waitBusy = () => {
+      if (!autoFarmManager.busy || Date.now() >= waitUntil) {
+        if (autoFarmManager.busy) {
+          console.log("[shutdown] 等待 autoFarmManager 周期超时，强制继续关闭");
+        }
+        finishShutdown();
+        return;
+      }
+      setTimeout(waitBusy, 200);
+    };
+    console.log("[shutdown] 等待 autoFarmManager 当前周期完成...");
+    waitBusy();
+  } else {
+    finishShutdown();
+  }
+}
+
+function finishShutdown() {
   try {
     close();
   } catch (_) {}
+
+  // 关闭所有 WebSocket 连接
+  try {
+    if (wss) {
+      for (const client of wss.clients) {
+        try { client.close(); } catch (_) {}
+      }
+      wss.close();
+    }
+  } catch (_) {}
+
+  console.log("[shutdown] 关闭完成");
   process.exit(0);
 }
 
+// 15 秒超时保护：无论何种情况，强制退出
+setTimeout(() => {
+  if (isShuttingDown) {
+    console.log("[shutdown] 超时保护触发，强制退出");
+    process.exit(1);
+  }
+}, 15_000);
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// 全局异常处理
+process.on("uncaughtException", (error) => {
+  const msg = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  console.error(`[uncaughtException] ${msg}`);
+  if (stack) console.error(stack);
+  try { shutdown(); } catch (_) {}
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  console.warn(`[unhandledRejection] ${msg}`);
+  if (stack) console.warn(stack);
+});

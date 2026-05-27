@@ -28,7 +28,7 @@ function parseIntEnv(name, defaultValue) {
 }
 
 function getConfig() {
-  return {
+  const config = {
     cdpWsUrl: process.env.FARM_CDP_WS || "ws://127.0.0.1:62000",
     gatewayHost: process.env.FARM_GATEWAY_HOST || "127.0.0.1",
     gatewayPort: parseIntEnv("FARM_GATEWAY_PORT", 8787),
@@ -61,6 +61,22 @@ function getConfig() {
     qqHostVersion: process.env.FARM_QQ_HOST_VERSION || "qq-host-1",
     qqBundleOutPath: process.env.FARM_QQ_BUNDLE_OUT || "",
   };
+
+  // --- Basic config validation (warn only, degrade to defaults) ---
+  if (!Number.isInteger(config.gatewayPort) || config.gatewayPort < 1 || config.gatewayPort > 65535) {
+    console.warn(`[config] gatewayPort ${config.gatewayPort} out of range 1-65535, falling back to 8787`);
+    config.gatewayPort = 8787;
+  }
+  if (config.qqAppId && !/^\d+$/.test(config.qqAppId)) {
+    console.warn(`[config] qqAppId "${config.qqAppId}" is not pure digits, clearing`);
+    config.qqAppId = "";
+  }
+  if (config.cdpWsUrl && !/^wss?:\/\//.test(config.cdpWsUrl)) {
+    console.warn(`[config] cdpWsUrl "${config.cdpWsUrl}" does not start with ws:// or wss://, falling back to default`);
+    config.cdpWsUrl = "ws://127.0.0.1:62000";
+  }
+
+  return config;
 }
 
 module.exports = { getConfig };

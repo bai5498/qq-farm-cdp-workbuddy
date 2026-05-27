@@ -267,6 +267,40 @@
                 <small>自己农场的浇水、除草、杀虫改为整批执行；首次整批不再加经验后，本日后续轮次跳过打理。</small>
               </div>
             </label>
+            <label class="check-card">
+              <input type="checkbox" id="autoFertilizeEnabled" />
+              <div>
+                <strong>自动施肥</strong>
+                <small>在自己农场浇水后自动施肥。可选择肥料类型和施肥策略。</small>
+              </div>
+            </label>
+          </div>
+
+          <div class="input-grid compact" id="fertilizeConfigGrid" style="display:none">
+            <label class="field-block">
+              <span>肥料类型</span>
+              <select id="autoFertilizerType">
+                <option value="normal">普通肥料</option>
+                <option value="organic">有机肥料</option>
+              </select>
+            </label>
+            <label class="field-block">
+              <span>施肥策略</span>
+              <select id="autoFertilizeStrategy">
+                <option value="growing">仅生长中地块</option>
+                <option value="all">所有地块</option>
+                <option value="empty">仅空地</option>
+                <option value="low_level">低等级地块</option>
+              </select>
+            </label>
+            <label class="field-block" id="fertilizeMinLevelWrap" style="display:none">
+              <span>最大地块等级</span>
+              <input type="number" min="0" max="30" id="autoFertilizeMinLevel" placeholder="0" />
+            </label>
+            <label class="field-block">
+              <span>肥料ID(高级)</span>
+              <input type="number" min="1" max="100" id="autoFertilizerId" placeholder="2" />
+            </label>
           </div>
 
           <label class="field-block" style="margin-bottom:12px">
@@ -360,33 +394,27 @@
       </div>
     </section>
 
-    <footer class="support-section" aria-label="赞赏支持">
+    <footer class="support-section" aria-label="最近修复日志">
       <article class="support-card">
-        <div class="support-copy">
-          <p class="eyebrow">Support This Project</p>
-          <h2>喜欢这个脚本的话，可以扫一下赞赏码</h2>
-          <p class="support-text">
-            赞赏会继续用在购买ai维护脚本和后续的小功能打磨上。
-            右侧二维码已经预留好了展示位，点击可单独放大查看。
-            注意 赞赏完全自愿 赞赏了不代表我就一定给你什么东西 一切都是义务的！
-          </p>
+        <div class="support-copy" style="max-width:100%">
+          <p class="eyebrow">Fix Log</p>
+          <h2>最近修复日志（2026-05-27）</h2>
+          <div class="support-text" style="display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;font-size:13px;line-height:1.6">
+            <div><strong style="color:#e53935">🔴 Critical</strong> autoFarmPlantSource 配置传错参数（修后生效）</div>
+            <div><strong style="color:#fb8c00">🟠 High</strong> gameCtlReadyChanged 事件未 emit（修后自动补丁/启动生效）</div>
+            <div><strong style="color:#fb8c00">🟠 High</strong> toPositiveNumber(0) 返回 null（修后 landId=0 可正常操作）</div>
+            <div><strong style="color:#fb8c00">🟠 High</strong> 模板字面量注入风险（改为字符串拼接）</div>
+            <div><strong style="color:#fdd835">🟡 Medium</strong> 施肥 all 策略逻辑错误、opts 运算符优先级</div>
+            <div><strong style="color:#fdd835">🟡 Medium</strong> loadFarmConfig 竞态 + CDP 双重重连冲突</div>
+            <div><strong style="color:#fdd835">🟡 Medium</strong> 错误被静默吞没（加 console.debug）</div>
+            <div><strong style="color:#43a047">🟢 Low</strong> 魔术数字、PNG quality、重复 toInt、冗余导出等 7 项</div>
+          </div>
           <div class="support-tags" aria-hidden="true">
-            <span>持续维护</span>
-            <span>断线重连</span>
-            <span>自动化优化</span>
+            <span>18 个 bug 已修复</span>
+            <span>14 个模块验证通过</span>
+            <span>服务运行正常</span>
           </div>
         </div>
-
-        <a
-          class="support-qr"
-          href="./assets/reward-qr.svg"
-          target="_blank"
-          rel="noreferrer"
-          aria-label="打开赞赏码大图"
-        >
-          <img src="./assets/reward-qr.jpg" alt="项目赞赏码" />
-          <span class="support-qr-tip">点击查看大图</span>
-        </a>
       </article>
     </footer>
   </div>

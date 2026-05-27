@@ -13,6 +13,7 @@ const fsSync = require("node:fs");
 const WebSocket = require("ws");
 const path = require("node:path");
 const fs = require("node:fs/promises");
+const EventEmitter = require("node:events");
 const { CdpSession } = require("./cdp-session");
 const { WmpfCdpSession } = require("./cdp-wmpf-session");
 const { AutoFarmManager } = require("./auto-farm-manager");
@@ -22,6 +23,8 @@ const { QqWsSession } = require("./qq-ws-session");
 const { ensureGameCtl, callGameCtl } = require("./game-ctl-utils");
 const { buildQqBundle, getQqBundleState, patchQqGameFile, resolveQqPatchTarget } = require("./qq-bundle");
 const { QQ_RPC_GAME_CTL_METHODS } = require("./qq-rpc-spec");
+const { sleep, clampInt, wrapCallExpression } = require("./utils");
+const { findLatestQqMiniappByAppId, resolveQqMiniappRoots } = require("./qq-miniapp-discovery");
 
 const WS_PATH = "/ws";
 const REQUIRED_GAME_CTL_METHODS = [...QQ_RPC_GAME_CTL_METHODS];
@@ -47,6 +50,14 @@ const FARM_CONFIG_DEFAULT = {
   autoFarmPlantMode: "none",
   autoFarmPlantSource: "auto",
   autoFarmPlantSelectedSeedKey: "",
+  autoFarmFertilizeEnabled: false,
+  autoFarmFertilizerType: "normal",       // "normal" | "organic"
+  autoFarmFertilizerId: 2,
+  autoFarmFertilizeStrategy: "growing",   // "all" | "growing" | "empty" | "low_level"
+  autoFarmFertilizeMinLevel: 0,           // 配合 low_level 策略，最小地块等级
+  autoFarmFriendStrategy: "steal_and_help",
+  autoFarmAutoStart: false,
+  autoWatchPatch: false,
 };
 
 function farmConfigPath() {
@@ -60,8 +71,8 @@ async function loadFarmConfig() {
     if (parsed && typeof parsed === "object") {
       return { ...FARM_CONFIG_DEFAULT, ...parsed };
     }
-  } catch (_) {
-    /* 无文件或解析失败 */
+  } catch (e) {
+    console.debug("[gateway] loadFarmConfig failed:", e instanceof Error ? e.message : String(e));
   }
   return { ...FARM_CONFIG_DEFAULT };
 }
@@ -107,8 +118,8 @@ function tryLoadWmpfEmitter(config) {
     if (wmpf && wmpf.debugMessageEmitter) {
       return { emitter: wmpf.debugMessageEmitter };
     }
-  } catch (_) {
-    /* 单独运行 gateway、未装 wmpf 时忽略 */
+  } catch (e) {
+    console.debug("[gateway] wmpf module not available:", e instanceof Error ? e.message : String(e));
   }
   return null;
 }
@@ -138,6 +149,25 @@ function createGateway(config) {
   /** 并发多次 ensureCdp 时共用同一次 connect，避免重复建会话 */
   let ensureCdpInFlight = null;
 
+  /** ensureCdp 失败后后台重连定时器 */
+  let cdpReconnectTimer = null;
+
+  function startCdpReconnectTimer() {
+    if (cdpReconnectTimer) return;
+    cdpReconnectTimer = setInterval(async () => {
+      try {
+        const session = new CdpSession({ url: config.cdpWsUrl, timeoutMs: config.cdpTimeoutMs, reconnectEnabled: false });
+        await session.connect();
+        cdp = session;
+        clearInterval(cdpReconnectTimer);
+        cdpReconnectTimer = null;
+        console.log("[gateway][cdp] reconnected successfully");
+      } catch (e) {
+        console.debug("[gateway][cdp] reconnect attempt failed:", e instanceof Error ? e.message : String(e));
+      }
+    }, 10000);
+  }
+
   async function ensureCdp() {
     if (cdp) return cdp;
     if (!ensureCdpInFlight) {
@@ -146,17 +176,26 @@ function createGateway(config) {
           if (wmpfBridge) {
             cdp = new WmpfCdpSession(config, wmpfBridge.emitter);
           } else {
-            cdp = new CdpSession({ url: config.cdpWsUrl, timeoutMs: config.cdpTimeoutMs });
+            cdp = new CdpSession({ url: config.cdpWsUrl, timeoutMs: config.cdpTimeoutMs, reconnectEnabled: false });
           }
           await cdp.connect();
+          // 连接成功则清除重连定时器
+          if (cdpReconnectTimer) {
+            clearInterval(cdpReconnectTimer);
+            cdpReconnectTimer = null;
+          }
           return cdp;
         } catch (error) {
           if (cdp) {
             try {
               cdp.close();
-            } catch (_) {}
+            } catch (e) { console.debug("[gateway] cdp.close() failed:", e instanceof Error ? e.message : String(e)); }
           }
           cdp = null;
+          // 启动后台重连
+          if (!wmpfBridge) {
+            startCdpReconnectTimer();
+          }
           throw error;
         } finally {
           ensureCdpInFlight = null;
@@ -171,6 +210,12 @@ function createGateway(config) {
     readyTimeoutMs: config.qqWsReadyTimeoutMs,
     callTimeoutMs: config.qqWsCallTimeoutMs,
   });
+
+  /** 补丁失效检测：记录当前 bundle scriptHash */
+  let knownScriptHash = null;
+  /** 网关事件发射器（补丁失效等事件通知前端） */
+  const gatewayEmitter = new EventEmitter();
+
   qqWsSession.on("clientConnected", (_snapshot, client) => {
     console.log(`[gateway][qq_ws] client connected: id=${client.id} remote=${client.remoteAddress || "?"}`);
   });
@@ -180,6 +225,55 @@ function createGateway(config) {
     const ready = hello.gameCtlReady === true ? "ready" : "not_ready";
     const version = hello.version || "?";
     console.log(`[gateway][qq_ws] hello: id=${client.id} appPlatform=${appPlatform} gameCtl=${ready} version=${version}`);
+
+    // 补丁失效自动检测：比较 scriptHash
+    const clientScriptHash = hello.scriptHash || null;
+    if (knownScriptHash && clientScriptHash && clientScriptHash !== knownScriptHash) {
+      console.warn(`[gateway][qq_ws] scriptHash mismatch! known=${knownScriptHash} client=${clientScriptHash}`);
+      gatewayEmitter.emit("scriptHashMismatch", { known: knownScriptHash, client: clientScriptHash, client });
+      // 自动补丁
+      const farmConfig = autoFarmManager.getConfig ? autoFarmManager.getConfig() : {};
+      if (farmConfig.autoWatchPatch) {
+        console.log("[gateway][qq_ws] autoWatchPatch enabled, triggering auto-patch...");
+        triggerAutoPatch().catch((e) => {
+          console.debug("[gateway][qq_ws] auto-patch on scriptHash mismatch failed:", e instanceof Error ? e.message : String(e));
+        });
+      }
+    }
+    if (clientScriptHash) {
+      knownScriptHash = clientScriptHash;
+    }
+
+    // 自动农场自启动：hello 时 gameCtl ready 且 autoFarmAutoStart 为 true
+    if (hello.gameCtlReady === true) {
+      const farmConfig = autoFarmManager.getConfig ? autoFarmManager.getConfig() : {};
+      if (farmConfig.autoFarmAutoStart && !autoFarmManager.getState().running) {
+        console.log("[gateway][qq_ws] autoFarmAutoStart enabled, starting auto-farm...");
+        try {
+          autoFarmManager.start(farmConfig);
+        } catch (e) {
+          console.debug("[gateway][qq_ws] auto-farm auto-start failed:", e instanceof Error ? e.message : String(e));
+        }
+      }
+    }
+  });
+  qqWsSession.on("gameCtlReadyChanged", (_snapshot, client) => {
+    if (!client || !client.hello) return;
+    const clientScriptHash = client.hello.scriptHash || null;
+    if (knownScriptHash && clientScriptHash && clientScriptHash !== knownScriptHash) {
+      console.warn(`[gateway][qq_ws] scriptHash mismatch on gameCtlReadyChanged! known=${knownScriptHash} client=${clientScriptHash}`);
+      gatewayEmitter.emit("scriptHashMismatch", { known: knownScriptHash, client: clientScriptHash, client });
+      const farmConfig = autoFarmManager.getConfig ? autoFarmManager.getConfig() : {};
+      if (farmConfig.autoWatchPatch) {
+        console.log("[gateway][qq_ws] autoWatchPatch enabled, triggering auto-patch...");
+        triggerAutoPatch().catch((e) => {
+          console.debug("[gateway][qq_ws] auto-patch on gameCtlReadyChanged failed:", e instanceof Error ? e.message : String(e));
+        });
+      }
+    }
+    if (clientScriptHash) {
+      knownScriptHash = clientScriptHash;
+    }
   });
   qqWsSession.on("clientDisconnected", (_snapshot, client) => {
     console.log(`[gateway][qq_ws] client disconnected: id=${client.id}`);
@@ -265,18 +359,109 @@ function createGateway(config) {
   const previewInputQueues = new WeakMap();
   /** @type {WeakMap<any, { mode: string; session: any; currentX: number; currentY: number; fallbackFrom?: string | null }>} */
   const previewDragSessions = new WeakMap();
-  loadFarmConfig()
+  /** @type {Promise<any> | null} config loaded promise, to avoid race with start API */
+  let configLoadedPromise = loadFarmConfig()
     .then((savedConfig) => {
       autoFarmManager.updateConfig(savedConfig);
+      // 初始化 patch watcher（如果配置了 autoWatchPatch）
+      if (savedConfig.autoWatchPatch) {
+        startPatchWatcher();
+      }
     })
-    .catch(() => {});
+    .catch((e) => { console.debug("[gateway] loadFarmConfig initial failed:", e instanceof Error ? e.message : String(e)); });
+
+  /** Patch watcher 状态 */
+  let patchWatcherState = {
+    active: false,
+    lastCheckAt: null,
+    lastPatchAt: null,
+    lastPatchResult: null,
+    error: null,
+    watchIntervalMs: 30000,
+  };
+  let patchWatcherTimer = null;
+
+  async function triggerAutoPatch() {
+    try {
+      const target = resolveQqPatchTarget({
+        targetPath: config.qqGameJsPath,
+        appId: config.qqAppId,
+        fallbackTargetPath: config.qqGameJsPath,
+        fallbackAppId: config.qqAppId,
+        srcRoot: config.qqMiniappSrcRoot,
+      });
+      if (!target.targetPath) {
+        console.debug("[gateway][patch-watcher] no target path found for auto-patch");
+        patchWatcherState.error = "no target path found";
+        return;
+      }
+      const built = buildQqBundle({ config, projectRoot });
+      const patch = patchQqGameFile(target.targetPath, built.bundleText, { noBackup: false });
+      patchWatcherState.lastPatchAt = new Date().toISOString();
+      patchWatcherState.lastPatchResult = patch;
+      patchWatcherState.error = null;
+      console.log(`[gateway][patch-watcher] auto-patch applied: ${target.targetPath}`);
+      gatewayEmitter.emit("patchApplied", { target, patch });
+    } catch (e) {
+      patchWatcherState.error = e instanceof Error ? e.message : String(e);
+      console.debug("[gateway][patch-watcher] auto-patch failed:", patchWatcherState.error);
+    }
+  }
+
+  async function checkPatchWatcher() {
+    patchWatcherState.lastCheckAt = new Date().toISOString();
+    try {
+      if (config.qqAppId) {
+        const result = findLatestQqMiniappByAppId({
+          appId: config.qqAppId,
+          srcRoot: config.qqMiniappSrcRoot,
+        });
+        const candidate = result.selected;
+        if (candidate && candidate.gameJsPath) {
+          const bundleState = getQqBundleState(config);
+          if (bundleState && bundleState.scriptHash && candidate.releaseHash &&
+              bundleState.scriptHash !== candidate.releaseHash) {
+            console.log(`[gateway][patch-watcher] new version detected, triggering patch...`);
+            await triggerAutoPatch();
+          }
+        }
+      }
+    } catch (e) {
+      patchWatcherState.error = e instanceof Error ? e.message : String(e);
+      console.debug("[gateway][patch-watcher] check failed:", patchWatcherState.error);
+    }
+  }
+
+  function startPatchWatcher() {
+    if (patchWatcherTimer) return;
+    patchWatcherState.active = true;
+    patchWatcherState.error = null;
+    console.log(`[gateway][patch-watcher] starting with interval ${patchWatcherState.watchIntervalMs}ms`);
+    // 首次立即检查一次
+    checkPatchWatcher().catch((e) => {
+      console.debug("[gateway][patch-watcher] initial check failed:", e instanceof Error ? e.message : String(e));
+    });
+    patchWatcherTimer = setInterval(() => {
+      checkPatchWatcher().catch((e) => {
+        console.debug("[gateway][patch-watcher] periodic check failed:", e instanceof Error ? e.message : String(e));
+      });
+    }, patchWatcherState.watchIntervalMs);
+  }
+
+  function stopPatchWatcher() {
+    if (patchWatcherTimer) {
+      clearInterval(patchWatcherTimer);
+      patchWatcherTimer = null;
+    }
+    patchWatcherState.active = false;
+  }
 
   /**
    * 在 ensureCdp 尚未执行时，WmpfCdpSession 还未订阅 miniappconnected，会漏掉事件。
    * 在网关层先订阅，小程序或 DevTools 一连上就开始建会话并探测 ctx（与 cdp-wmpf-session 内逻辑叠加无害）。
    */
   function kickEnsureCdpOnTransport() {
-    ensureCdp().catch(() => {});
+    ensureCdp().catch((e) => { console.debug("[gateway] kickEnsureCdpOnTransport failed:", e instanceof Error ? e.message : String(e)); });
   }
   if (wmpfBridge) {
     wmpfBridge.emitter.on("miniappconnected", kickEnsureCdpOnTransport);
@@ -287,31 +472,6 @@ function createGateway(config) {
     return `(async () => {\n${body}\n})()`;
   }
 
-  function wrapCallExpression(dotPath, args) {
-    const parts = String(dotPath || "").split(".").filter(Boolean);
-    if (parts.length === 0) throw new Error("call.path empty");
-    const jsonArgs = JSON.stringify(args ?? []);
-    return `(async () => {
-      const _path = ${JSON.stringify(parts)};
-      let cur = globalThis;
-      for (let i = 0; i < _path.length; i++) {
-        cur = cur[_path[i]];
-        if (cur == null) throw new Error('call path not found at: ' + _path.slice(0, i + 1).join('.'));
-      }
-      if (typeof cur !== 'function') throw new Error('call path is not a function: ' + _path.join('.'));
-      return await cur.apply(null, ${jsonArgs});
-    })()`;
-  }
-
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
-  }
-
-  function clampInt(value, defaultValue, min, max) {
-    const n = Number.parseInt(String(value ?? ""), 10);
-    const fallback = Number.isFinite(n) ? n : defaultValue;
-    return Math.min(max, Math.max(min, fallback));
-  }
 
   function makeTouchPoint(x, y) {
     return {
@@ -326,7 +486,7 @@ function createGateway(config) {
 
   function enqueuePreviewInput(socket, task) {
     const prev = previewInputQueues.get(socket) || Promise.resolve();
-    const next = prev.catch(() => {}).then(task);
+    const next = prev.catch((e) => { console.debug("[gateway] previewInputQueue prev failed:", e instanceof Error ? e.message : String(e)); }).then(task);
     previewInputQueues.set(socket, next.finally(() => {
       if (previewInputQueues.get(socket) === next) {
         previewInputQueues.delete(socket);
@@ -663,7 +823,7 @@ function createGateway(config) {
         throw new Error("injectFile.path must stay under project root");
       }
       const script = await fs.readFile(abs, "utf8");
-      const expr = `(async () => { ${script}\n; return { injected: true, file: ${JSON.stringify(rel)} }; })()`;
+      const expr = "(async () => { " + script + "\n; return { injected: true, file: " + JSON.stringify(rel) + " }; })()";
       const value = await session.evaluate(expr, execOpts);
       return value;
     }
@@ -717,7 +877,7 @@ function createGateway(config) {
         if (existing) {
           try {
             await endCdpDrag(existing, existing.currentX, existing.currentY);
-          } catch (_) {}
+          } catch (e) { console.debug("[gateway] endCdpDrag on dragStart cleanup failed:", e instanceof Error ? e.message : String(e)); }
           previewDragSessions.delete(socket);
         }
         const state = await beginCdpDrag(session, x, y);
@@ -817,12 +977,14 @@ function createGateway(config) {
     if (req.method === "GET" && urlPath === "/api/health") {
       if (!cdp && resolveAutomationRuntimeTarget() !== "qq_ws") {
         setImmediate(() => {
-          ensureCdp().catch(() => {});
+          ensureCdp().catch((e) => { console.debug("[gateway] health ensureCdp failed:", e instanceof Error ? e.message : String(e)); });
         });
       }
       const payload = {
         ok: true,
         uptimeSec: Math.floor(process.uptime()),
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
         gateway: {
           cdpWsUrl: config.cdpWsUrl,
           wmpfBridge: !!wmpfBridge,
@@ -835,6 +997,7 @@ function createGateway(config) {
         qqBundle: getQqBundleSnapshot(),
         autoFarm: autoFarmManager.getState(),
         preview: previewManager.getState(),
+        patchWatcher: patchWatcherState,
         cdpSessionInitialized: cdp != null,
         cdpWarmPending: cdp == null,
         wsClients: wss.clients.size,
@@ -949,6 +1112,12 @@ function createGateway(config) {
         const parsed = await readJsonBody(req);
         const data = await saveFarmConfig(parsed);
         autoFarmManager.updateConfig(data);
+        // autoWatchPatch 变化时启动/停止 patch watcher
+        if (data.autoWatchPatch && !patchWatcherState.active) {
+          startPatchWatcher();
+        } else if (!data.autoWatchPatch && patchWatcherState.active) {
+          stopPatchWatcher();
+        }
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ ok: true, data }));
       } catch (e) {
@@ -1006,14 +1175,23 @@ function createGateway(config) {
         if (parsed.config && typeof parsed.config === "object") {
           savedConfig = await saveFarmConfig(parsed.config);
           autoFarmManager.updateConfig(savedConfig);
+          // autoWatchPatch 变化时启动/停止 patch watcher
+          if (savedConfig.autoWatchPatch && !patchWatcherState.active) {
+            startPatchWatcher();
+          } else if (!savedConfig.autoWatchPatch && patchWatcherState.active) {
+            stopPatchWatcher();
+          }
         }
 
         let data;
         if (action === "start") {
+          // 等待初始配置加载完成，避免竞态
+          if (configLoadedPromise) await configLoadedPromise;
           data = autoFarmManager.start(savedConfig || parsed.config);
         } else if (action === "stop") {
           data = autoFarmManager.stop("api");
         } else if (action === "runOnce") {
+          if (configLoadedPromise) await configLoadedPromise;
           data = await autoFarmManager.runOnce(savedConfig || parsed.config);
         } else if (action === "update") {
           if (!savedConfig && parsed.config && typeof parsed.config === "object") {
@@ -1137,7 +1315,7 @@ function createGateway(config) {
       const dragState = previewDragSessions.get(socket);
       if (dragState) {
         previewDragSessions.delete(socket);
-        void endCdpDrag(dragState, dragState.currentX, dragState.currentY).catch(() => {});
+        void endCdpDrag(dragState, dragState.currentX, dragState.currentY).catch((e) => { console.debug("[gateway] endCdpDrag on socket close failed:", e instanceof Error ? e.message : String(e)); });
       }
       previewManager.removeSocket(socket);
       const state = previewManager.getState();
@@ -1150,9 +1328,15 @@ function createGateway(config) {
   return {
     httpServer,
     wss,
+    autoFarmManager,
     close: () => {
       autoFarmManager.stop("gateway close");
       void previewManager.close();
+      stopPatchWatcher();
+      if (cdpReconnectTimer) {
+        clearInterval(cdpReconnectTimer);
+        cdpReconnectTimer = null;
+      }
       if (wmpfBridge) {
         wmpfBridge.emitter.off("miniappconnected", kickEnsureCdpOnTransport);
       }
@@ -1164,6 +1348,7 @@ function createGateway(config) {
     },
     getCdp: () => cdp,
     getQqWsSession: () => qqWsSession,
+    getGatewayEmitter: () => gatewayEmitter,
   };
 }
 

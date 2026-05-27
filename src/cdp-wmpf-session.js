@@ -207,7 +207,9 @@ class WmpfCdpSession extends EventEmitter {
       );
       if (this._hasMiniappTransport()) {
         setImmediate(() => {
-          this._ensureRuntimeEnabled(EXPLICIT_CONTEXT_RUNTIME_ENABLE_MS).catch(() => {});
+          this._ensureRuntimeEnabled(EXPLICIT_CONTEXT_RUNTIME_ENABLE_MS).catch((e) => {
+            console.debug("[cdp-wmpf-session] Runtime.enable failed:", e instanceof Error ? e.message : String(e));
+          });
         });
       }
       return;

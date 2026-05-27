@@ -1,10 +1,6 @@
 "use strict";
 
-function toInt(value, defaultValue, min, max) {
-  const n = Number.parseInt(String(value ?? ""), 10);
-  const fallback = Number.isFinite(n) ? n : defaultValue;
-  return Math.min(max, Math.max(min, fallback));
-}
+const { toInt } = require("./utils");
 
 function normalizePreviewOptions(raw) {
   const src = raw && typeof raw === "object" ? raw : {};
@@ -64,7 +60,7 @@ class PreviewManager {
   }
 
   _safeSend(socket, payload) {
-    if (!socket || socket.readyState !== 1) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
     if (typeof socket.bufferedAmount === "number" && socket.bufferedAmount > 2_000_000) {
       return;
     }
@@ -152,13 +148,16 @@ class PreviewManager {
 
     try {
       await session.sendCommand("Page.enable", {});
-      await session.sendCommand("Page.startScreencast", {
+      const screencastParams = {
         format: nextOptions.format,
-        quality: nextOptions.quality,
         maxWidth: nextOptions.maxWidth,
         maxHeight: nextOptions.maxHeight,
         everyNthFrame: nextOptions.everyNthFrame,
-      });
+      };
+      if (nextOptions.format === "jpeg" && nextOptions.quality != null) {
+        screencastParams.quality = nextOptions.quality;
+      }
+      await session.sendCommand("Page.startScreencast", screencastParams);
       this.running = true;
       this._emitState({ reason: "started" });
       return this.getState();

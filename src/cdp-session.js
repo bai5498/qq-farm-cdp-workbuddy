@@ -8,7 +8,7 @@ const WebSocket = require("ws");
 
 class CdpSession extends EventEmitter {
   /**
-   * @param {{ url: string; timeoutMs?: number }} opts
+   * @param {{ url: string; timeoutMs?: number; reconnectEnabled?: boolean; maxReconnectAttempts?: number }} opts
    */
   constructor(opts) {
     super();
@@ -19,16 +19,36 @@ class CdpSession extends EventEmitter {
     this.nextId = 1;
     /** @type {Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>} */
     this.pending = new Map();
+
+    // 重连相关
+    this.reconnectEnabled = opts.reconnectEnabled !== false;
+    this.maxReconnectAttempts = opts.maxReconnectAttempts ?? Infinity;
+    /** @type {NodeJS.Timeout | null} */
+    this._reconnectTimer = null;
+    this._reconnectAttempts = 0;
+    this._closed = false;
   }
 
   async connect() {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
 
+    this._closed = false;
+
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url);
       this.ws = ws;
-      ws.once("open", () => resolve(undefined));
-      ws.once("error", reject);
+
+      const onOpen = () => {
+        ws.removeListener("error", onError);
+        resolve(undefined);
+      };
+      const onError = (err) => {
+        ws.removeListener("open", onOpen);
+        reject(err);
+      };
+
+      ws.once("open", onOpen);
+      ws.once("error", onError);
     });
 
     const ws = this.ws;
@@ -43,6 +63,7 @@ class CdpSession extends EventEmitter {
       try {
         msg = JSON.parse(text);
       } catch {
+        console.warn("[cdp-session] JSON parse failed, raw:", text);
         return;
       }
 
@@ -73,9 +94,61 @@ class CdpSession extends EventEmitter {
         p.reject(new Error("CDP WebSocket closed"));
       }
       this.pending.clear();
+
+      if (this.reconnectEnabled && !this._closed) {
+        this._scheduleReconnect();
+      }
     });
 
+    ws.on("error", (err) => {
+      console.error("[cdp-session] WebSocket error:", err.message || err);
+    });
+
+    // 连接成功，重置重连计数
+    this._reconnectAttempts = 0;
+
     await this.send("Runtime.enable", {});
+  }
+
+  /**
+   * 指数退避重连调度：1s -> 2s -> 4s -> 8s，上限 30s
+   */
+  _scheduleReconnect() {
+    if (this._closed) return;
+    if (this._reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error(
+        `[cdp-session] Max reconnect attempts (${this.maxReconnectAttempts}) reached, giving up.`
+      );
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, this._reconnectAttempts), 30000);
+    this._reconnectAttempts++;
+
+    console.log(
+      `[cdp-session] Reconnecting in ${delay}ms (attempt ${this._reconnectAttempts})...`
+    );
+
+    this._reconnectTimer = setTimeout(async () => {
+      this._reconnectTimer = null;
+      if (this._closed) return;
+
+      try {
+        // 清理旧 ws
+        if (this.ws) {
+          try { this.ws.removeAllListeners(); } catch (_) {}
+          this.ws = null;
+        }
+
+        await this.connect();
+        this.emit("reconnected");
+        console.log("[cdp-session] Reconnected successfully.");
+      } catch (err) {
+        console.error("[cdp-session] Reconnect failed:", err.message || err);
+        // 继续重连
+        this._scheduleReconnect();
+      }
+    }, delay);
   }
 
   /**
@@ -146,8 +219,17 @@ class CdpSession extends EventEmitter {
   }
 
   close() {
+    this._closed = true;
+
+    // 取消重连定时器
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+
     if (this.ws) {
       try {
+        this.ws.removeAllListeners();
         this.ws.close();
       } catch (_) {}
       this.ws = null;

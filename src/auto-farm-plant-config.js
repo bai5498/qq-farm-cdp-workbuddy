@@ -1,5 +1,7 @@
 "use strict";
 
+const { normalizeText } = require("./utils");
+
 const AUTO_PLANT_MODE_SET = new Set([
   "none",
   "highest",
@@ -12,10 +14,6 @@ const AUTO_PLANT_SOURCE_SET = new Set([
   "backpack",
   "shop",
 ]);
-
-function normalizeText(value) {
-  return value == null ? "" : String(value).trim();
-}
 
 function normalizeAutoPlantMode(mode) {
   const raw = normalizeText(mode);
@@ -65,8 +63,21 @@ function readAutoPlantSelectedSeedKey(src) {
   ]);
 }
 
+const FRIEND_STRATEGY_SET = new Set([
+  "steal_only",
+  "help_first",
+  "help_only",
+  "steal_and_help",
+]);
+
+function normalizeFriendStrategy(value) {
+  const raw = normalizeText(value);
+  return FRIEND_STRATEGY_SET.has(raw) ? raw : "steal_and_help";
+}
+
 module.exports = {
   normalizeAutoPlantMode,
   normalizeAutoPlantSource,
+  normalizeFriendStrategy,
   readAutoPlantSelectedSeedKey,
 };

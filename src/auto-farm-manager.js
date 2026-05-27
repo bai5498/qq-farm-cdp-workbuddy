@@ -1,43 +1,56 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
+const { toBool, toInt, getLocalDateKey } = require("./utils");
 const { ensureGameCtl, callGameCtl } = require("./game-ctl-utils");
 const { runAutoFarmCycle } = require("./auto-farm-executor");
 const {
   normalizeAutoPlantMode,
   normalizeAutoPlantSource,
+  normalizeFriendStrategy,
   readAutoPlantSelectedSeedKey,
 } = require("./auto-farm-plant-config");
 
-function toBool(value, defaultValue) {
-  if (value == null) return defaultValue;
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  const text = String(value).trim().toLowerCase();
-  if (!text) return defaultValue;
-  if (["1", "true", "yes", "on"].includes(text)) return true;
-  if (["0", "false", "no", "off"].includes(text)) return false;
-  return defaultValue;
-}
+// ---------------------------------------------------------------------------
+// Runtime-state file
+// ---------------------------------------------------------------------------
 
-function toInt(value, defaultValue, min, max) {
-  const n = Number.parseInt(String(value ?? ""), 10);
-  const fallback = Number.isFinite(n) ? n : defaultValue;
-  return Math.min(max, Math.max(min, fallback));
-}
+const RUNTIME_STATE_FILENAME = "runtime-state.json";
+const RUNTIME_STATE_SAVE_INTERVAL_MS = 30_000;
 
-function getLocalDateKey(dateLike = Date.now()) {
-  const date = dateLike instanceof Date ? dateLike : new Date(dateLike);
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function formatCareActionLabel(key) {
   if (key === "water") return "浇水";
   if (key === "eraseGrass") return "除草";
   if (key === "killBug") return "杀虫";
   return key ? String(key) : "打理";
+}
+
+// ---------------------------------------------------------------------------
+// Config normalizer
+// ---------------------------------------------------------------------------
+
+/** 规范化施肥策略 */
+function normalizeFertilizeStrategy(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (["all", "growing", "empty", "low_level"].includes(raw)) return raw;
+  return "growing";
+}
+
+/** 规范化肥料类型 */
+function normalizeFertilizerType(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "organic") return "organic";
+  return "normal";
+}
+
+/** 根据肥料类型获取默认肥料ID */
+function getDefaultFertilizerId(type) {
+  return type === "organic" ? 3 : 2;
 }
 
 function normalizeAutoFarmConfig(raw) {
@@ -56,11 +69,22 @@ function normalizeAutoFarmConfig(raw) {
     autoFarmReturnHome: toBool(src.autoFarmReturnHome, true),
     autoFarmStopOnError: toBool(src.autoFarmStopOnError, false),
     autoFarmStopCareWhenNoExp: toBool(src.autoFarmStopCareWhenNoExp, false),
+    autoFarmAutoStart: toBool(src.autoFarmAutoStart, false),
+    autoFarmFertilizeEnabled: toBool(src.autoFarmFertilizeEnabled, false),
+    autoFarmFertilizerType: normalizeFertilizerType(src.autoFarmFertilizerType),
+    autoFarmFertilizerId: toInt(src.autoFarmFertilizerId, getDefaultFertilizerId(normalizeFertilizerType(src.autoFarmFertilizerType)), 1, 100),
+    autoFarmFertilizeStrategy: normalizeFertilizeStrategy(src.autoFarmFertilizeStrategy),
+    autoFarmFertilizeMinLevel: toInt(src.autoFarmFertilizeMinLevel, 0, 0, 30),
+    autoFarmFriendStrategy: normalizeFriendStrategy(src.autoFarmFriendStrategy),
     autoFarmPlantMode,
     autoFarmPlantSource,
     autoFarmPlantSelectedSeedKey: readAutoPlantSelectedSeedKey(src),
   };
 }
+
+// ---------------------------------------------------------------------------
+// AutoFarmManager
+// ---------------------------------------------------------------------------
 
 class AutoFarmManager {
   /**
@@ -73,6 +97,7 @@ class AutoFarmManager {
    *   ensureCdp?: () => Promise<any>,
    *   getCdp?: () => any,
    *   projectRoot: string,
+   *   onReady?: (cb: () => void) => void,
    * }} opts
    */
   constructor(opts) {
@@ -106,10 +131,130 @@ class AutoFarmManager {
     // 仅保存在当前 Node 进程内存里；不做账号隔离，但会按本地日期自动清空。
     this.careExpLimitState = null;
     this.config = normalizeAutoFarmConfig({});
+
+    // Runtime-state persistence
+    this._runtimeStatePath = path.join(this.projectRoot, "data", RUNTIME_STATE_FILENAME);
+    this._lastSavedRuntimeState = null;
+    this._lastSavedAt = 0;
+    this._saveTimer = null;
+
+    // Auto-start
+    this._clientHelloReceived = false;
+    if (typeof opts.onReady === "function") {
+      opts.onReady(() => this._onClientReady());
+    }
   }
+
+  // -------------------------------------------------------------------------
+  // Auto-start
+  // -------------------------------------------------------------------------
+
+  _onClientReady() {
+    if (this._clientHelloReceived) return;
+    this._clientHelloReceived = true;
+    if (this.config.autoFarmAutoStart && !this.running) {
+      try {
+        this.start();
+        this._pushEvent("info", "自动启动: 客户端就绪，已自动开启自动化");
+      } catch (err) {
+        this._pushEvent("error", `自动启动失败: ${err.message}`);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Runtime-state persistence
+  // -------------------------------------------------------------------------
+
+  _saveRuntimeState() {
+    const now = Date.now();
+    if (now - this._lastSavedAt < RUNTIME_STATE_SAVE_INTERVAL_MS) {
+      // Throttled – schedule a deferred save if not already scheduled
+      if (!this._saveTimer) {
+        const delay = RUNTIME_STATE_SAVE_INTERVAL_MS - (now - this._lastSavedAt);
+        this._saveTimer = setTimeout(() => {
+          this._saveTimer = null;
+          this._saveRuntimeStateNow();
+        }, Math.max(100, delay));
+      }
+      return;
+    }
+    this._saveRuntimeStateNow();
+  }
+
+  _saveRuntimeStateNow() {
+    this._lastSavedAt = Date.now();
+    const state = {
+      running: this.running,
+      lastOwnRunAt: this.lastOwnRunAt,
+      lastFriendRunAt: this.lastFriendRunAt,
+      careExpLimitState: this.careExpLimitState ? { ...this.careExpLimitState } : null,
+      config: { ...this.config },
+    };
+    const json = JSON.stringify(state, null, 2);
+    // Skip write if unchanged
+    if (json === this._lastSavedRuntimeState) return;
+    this._lastSavedRuntimeState = json;
+    try {
+      const dir = path.dirname(this._runtimeStatePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this._runtimeStatePath, json, "utf8");
+    } catch (err) {
+      this._pushEvent("error", `保存运行状态失败: ${err.message}`);
+    }
+  }
+
+  _loadRuntimeState() {
+    try {
+      if (!fs.existsSync(this._runtimeStatePath)) return null;
+      const json = fs.readFileSync(this._runtimeStatePath, "utf8");
+      return JSON.parse(json);
+    } catch (err) {
+      this._pushEvent("error", `加载运行状态失败: ${err.message}`);
+      return null;
+    }
+  }
+
+  _restoreRuntimeState() {
+    const saved = this._loadRuntimeState();
+    if (!saved) return;
+    if (typeof saved.lastOwnRunAt === "number" && saved.lastOwnRunAt > 0) {
+      this.lastOwnRunAt = saved.lastOwnRunAt;
+    }
+    if (typeof saved.lastFriendRunAt === "number" && saved.lastFriendRunAt > 0) {
+      this.lastFriendRunAt = saved.lastFriendRunAt;
+    }
+    if (saved.careExpLimitState && typeof saved.careExpLimitState === "object") {
+      this.careExpLimitState = saved.careExpLimitState;
+    }
+    if (saved.config && typeof saved.config === "object") {
+      this.config = normalizeAutoFarmConfig(saved.config);
+    }
+    if (saved.running) {
+      try {
+        this.start();
+        this._pushEvent("info", "已恢复之前运行状态，自动化重新启动");
+      } catch (err) {
+        this._pushEvent("error", `恢复运行状态启动失败: ${err.message}`);
+      }
+    }
+  }
+
+  flushRuntimeState() {
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer);
+      this._saveTimer = null;
+    }
+    this._saveRuntimeStateNow();
+  }
+
+  // -------------------------------------------------------------------------
+  // Config & state
+  // -------------------------------------------------------------------------
 
   updateConfig(raw) {
     this.config = normalizeAutoFarmConfig({ ...this.config, ...(raw && typeof raw === "object" ? raw : {}) });
+    this._saveRuntimeState();
     return this.config;
   }
 
@@ -140,6 +285,7 @@ class AutoFarmManager {
     this.running = true;
     this._pushEvent("info", "自动化已启动");
     this._schedule(50);
+    this._saveRuntimeState();
     return this.getState();
   }
 
@@ -151,6 +297,7 @@ class AutoFarmManager {
       this.timer = null;
     }
     this._pushEvent("info", `自动化已停止: ${reason}`);
+    this._saveRuntimeState();
     return this.getState();
   }
 
@@ -165,6 +312,19 @@ class AutoFarmManager {
     return await this._runCycle(true);
   }
 
+  // -------------------------------------------------------------------------
+  // Graceful shutdown
+  // -------------------------------------------------------------------------
+
+  shutdown() {
+    this.stop("shutdown");
+    this.flushRuntimeState();
+  }
+
+  // -------------------------------------------------------------------------
+  // Event log
+  // -------------------------------------------------------------------------
+
   _pushEvent(level, message, extra) {
     const entry = {
       time: new Date().toISOString(),
@@ -178,6 +338,10 @@ class AutoFarmManager {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Scheduling
+  // -------------------------------------------------------------------------
+
   _schedule(delayMs) {
     if (!this.running) return;
     if (this.timer) clearTimeout(this.timer);
@@ -188,7 +352,7 @@ class AutoFarmManager {
       void this._tick().catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.lastFinishedAt = new Date().toISOString();
-        this.lastError = err.message;
+        this.lastError = err.stack || err.message;
         this._pushEvent("error", `调度异常: ${err.message}`);
         if (this.config.autoFarmStopOnError) {
           this.stop(`error: ${err.message}`);
@@ -234,6 +398,10 @@ class AutoFarmManager {
     );
     return { ownDue, friendDue };
   }
+
+  // -------------------------------------------------------------------------
+  // Care-exp limit
+  // -------------------------------------------------------------------------
 
   _pruneCareExpLimit(now) {
     if (!this.careExpLimitState) return;
@@ -295,6 +463,10 @@ class AutoFarmManager {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Tick & cycle
+  // -------------------------------------------------------------------------
+
   async _tick() {
     if (!this.running) return;
     if (this.busy) {
@@ -343,6 +515,8 @@ class AutoFarmManager {
       "waterLands",
       "killBugLands",
       "eraseGrassLands",
+      "fertilizeSingleLand",
+      "fertilizeLands",
       "clickMatureEffect",
       "getHarvestablePlantLandIds",
       "plantSingleLand",
@@ -380,6 +554,12 @@ class AutoFarmManager {
         includeWater: !skipCareBecauseNoExp,
         includeEraseGrass: !skipCareBecauseNoExp,
         includeKillBug: !skipCareBecauseNoExp,
+        includeFertilize: !!this.config.autoFarmFertilizeEnabled,
+        fertilizerId: this.config.autoFarmFertilizerId || getDefaultFertilizerId(this.config.autoFarmFertilizerType),
+        fertilizerType: this.config.autoFarmFertilizerType || "normal",
+        fertilizeStrategy: this.config.autoFarmFertilizeStrategy || "growing",
+        fertilizeMinLevel: this.config.autoFarmFertilizeMinLevel || 0,
+        friendStrategy: this.config.autoFarmFriendStrategy,
         stopCareWhenNoExp: !!this.config.autoFarmStopCareWhenNoExp,
         autoPlantMode: this.config.autoFarmPlantMode || "none",
         autoPlantSource: this.config.autoFarmPlantSource || "auto",
@@ -416,14 +596,16 @@ class AutoFarmManager {
           skipCareBecauseNoExp,
         },
       );
+      this._saveRuntimeState();
       return this.getState();
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       const completedAtMs = Date.now();
       this._markRunCompletedAt(due, completedAtMs);
       this.lastFinishedAt = new Date(completedAtMs).toISOString();
-      this.lastError = err.message;
+      this.lastError = err.stack || err.message;
       this._pushEvent("error", `执行失败: ${err.message}`);
+      this._saveRuntimeState();
       throw err;
     } finally {
       this.busy = false;

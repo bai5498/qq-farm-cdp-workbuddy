@@ -67,6 +67,13 @@ import {
     autoActionWaitMs,
     autoStopOnError,
     autoStopCareWhenNoExp,
+    autoFertilizeEnabled,
+    autoFertilizerType,
+    autoFertilizeStrategy,
+    autoFertilizeMinLevel,
+    autoFertilizerId,
+    fertilizeConfigGrid,
+    fertilizeMinLevelWrap,
     autoPlantMode,
     autoPlantSource,
     autoPlantSelectedWrap,
@@ -540,6 +547,13 @@ import {
     autoActionWaitMs.value = cfg.autoFarmActionWaitMs != null ? cfg.autoFarmActionWaitMs : 1200;
     autoStopOnError.checked = !!cfg.autoFarmStopOnError;
     autoStopCareWhenNoExp.checked = !!cfg.autoFarmStopCareWhenNoExp;
+    autoFertilizeEnabled.checked = !!cfg.autoFarmFertilizeEnabled;
+    autoFertilizerType.value = cfg.autoFarmFertilizerType === "organic" ? "organic" : "normal";
+    autoFertilizeStrategy.value = ["all", "growing", "empty", "low_level"].indexOf(cfg.autoFarmFertilizeStrategy) >= 0
+      ? cfg.autoFarmFertilizeStrategy : "growing";
+    autoFertilizeMinLevel.value = cfg.autoFarmFertilizeMinLevel != null ? cfg.autoFarmFertilizeMinLevel : 0;
+    autoFertilizerId.value = cfg.autoFarmFertilizerId != null ? cfg.autoFarmFertilizerId : 2;
+    syncFertilizeControls();
     autoPlantMode.value = normalizeAutoPlantModeValue(cfg.autoFarmPlantMode);
     autoPlantSource.value = normalizeAutoPlantSourceValue(cfg.autoFarmPlantSource, cfg.autoFarmPlantMode);
     pendingAutoPlantSelectedSeedKey = normalizeText(
@@ -577,6 +591,12 @@ import {
       autoFarmActionWaitMs: Number(autoActionWaitMs.value || 1200),
       autoFarmStopOnError: !!autoStopOnError.checked,
       autoFarmStopCareWhenNoExp: !!autoStopCareWhenNoExp.checked,
+      autoFarmFertilizeEnabled: !!autoFertilizeEnabled.checked,
+      autoFarmFertilizerType: autoFertilizerType.value === "organic" ? "organic" : "normal",
+      autoFarmFertilizeStrategy: ["all", "growing", "empty", "low_level"].indexOf(autoFertilizeStrategy.value) >= 0
+        ? autoFertilizeStrategy.value : "growing",
+      autoFarmFertilizeMinLevel: Number(autoFertilizeMinLevel.value || 0),
+      autoFarmFertilizerId: Number(autoFertilizerId.value || 2),
       autoFarmPlantMode: normalizeAutoPlantModeValue(autoPlantMode.value || "none"),
       autoFarmPlantSource: normalizeAutoPlantSourceValue(autoPlantSource.value || "auto", autoPlantMode.value),
       autoFarmPlantSelectedSeedKey: selectedSeedKey,
@@ -733,6 +753,27 @@ import {
     }
   }
 
+  function syncFertilizeControls() {
+    const enabled = !!autoFertilizeEnabled.checked;
+    if (fertilizeConfigGrid) {
+      fertilizeConfigGrid.style.display = enabled ? "" : "none";
+    }
+    const strategy = autoFertilizeStrategy ? autoFertilizeStrategy.value : "growing";
+    if (fertilizeMinLevelWrap) {
+      fertilizeMinLevelWrap.style.display = (enabled && strategy === "low_level") ? "" : "none";
+    }
+    // 联动：选择肥料类型时自动更新肥料ID
+    if (autoFertilizerType && autoFertilizerId) {
+      const currentType = autoFertilizerType.value;
+      const currentId = Number(autoFertilizerId.value || 0);
+      if (currentType === "normal" && currentId === 3) {
+        autoFertilizerId.value = 2;
+      } else if (currentType === "organic" && currentId === 2) {
+        autoFertilizerId.value = 3;
+      }
+    }
+  }
+
   function loadAutoPlantSeedCatalog(silent) {
     if (btnAutoPlantRefreshSeeds) {
       btnAutoPlantRefreshSeeds.disabled = true;
@@ -784,6 +825,7 @@ import {
     if (key === "water") return "一键浇水";
     if (key === "eraseGrass") return "一键除草";
     if (key === "killBug") return "一键杀虫";
+    if (key === "fertilize") return "一键施肥";
     return key ? String(key) : "未知动作";
   }
 
@@ -791,6 +833,7 @@ import {
     if (key === "water") return "浇水";
     if (key === "eraseGrass") return "除草";
     if (key === "killBug") return "杀虫";
+    if (key === "fertilize") return "施肥";
     return key ? String(key) : "打理";
   }
 
@@ -1140,6 +1183,8 @@ import {
     if (!state) {
       txtAutoFarmState.textContent = "未加载自动化状态";
       logAutoFarm.textContent = "";
+      btnAutoStart.classList.remove("secondary");
+      btnAutoStop.classList.add("secondary");
       return;
     }
 
@@ -1159,6 +1204,15 @@ import {
     }
     txtAutoFarmState.textContent = parts.join(" · ");
     logAutoFarm.textContent = buildAutoFarmLogLines(state).join("\n");
+
+    // 根据运行状态切换按钮样式：运行中时，停止按钮为主按钮，开始按钮为次要按钮
+    if (state.running) {
+      btnAutoStart.classList.add("secondary");
+      btnAutoStop.classList.remove("secondary");
+    } else {
+      btnAutoStart.classList.remove("secondary");
+      btnAutoStop.classList.add("secondary");
+    }
   }
 
   function gatherPreviewOptions() {
@@ -2112,6 +2166,18 @@ import {
     if (normalizeAutoPlantModeValue(autoPlantMode.value) === "selected") {
       loadAutoPlantSeedCatalog(true);
     }
+  };
+
+  autoFertilizeEnabled.onchange = function () {
+    syncFertilizeControls();
+  };
+
+  autoFertilizeStrategy.onchange = function () {
+    syncFertilizeControls();
+  };
+
+  autoFertilizerType.onchange = function () {
+    syncFertilizeControls();
   };
 
   autoPlantSource.onchange = function () {

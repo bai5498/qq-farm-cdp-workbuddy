@@ -29,6 +29,8 @@ const QQ_RPC_GAME_CTL_METHODS = Object.freeze([
   "plantSeedsOnLands",
   "autoReconnectIfNeeded",
   "autoPlant",
+  "fertilizeSingleLand",
+  "fertilizeLands",
 ]);
 
 module.exports = {

@@ -3,13 +3,11 @@
 const {
   normalizeAutoPlantMode,
   normalizeAutoPlantSource,
+  normalizeFriendStrategy,
   readAutoPlantSelectedSeedKey,
 } = require("./auto-farm-plant-config");
 
-function wait(ms) {
-  const delayMs = Math.max(0, Number(ms) || 0);
-  return new Promise((resolve) => setTimeout(resolve, delayMs));
-}
+const { sleep: wait, toErrorMessage, normalizeText, toPositiveNumber } = require("./utils");
 
 function summarizeFarmStatus(status) {
   if (!status || typeof status !== "object") return null;
@@ -24,10 +22,6 @@ function summarizeFarmStatus(status) {
 function getWorkCount(status, key) {
   if (!status || !status.workCounts || typeof status.workCounts !== "object") return 0;
   return Number(status.workCounts[key]) || 0;
-}
-
-function toErrorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function withSilent(opts, extra) {
@@ -47,8 +41,43 @@ async function autoReconnectIfNeeded(session, callGameCtl, opts) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Recovery error classification
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine whether an error is recoverable (e.g. disconnection, timeout, not connected).
+ * Non-recoverable errors (parameter errors, permission errors, etc.) should not be retried.
+ */
+function isRecoverableError(error) {
+  const msg = toErrorMessage(error).toLowerCase();
+  if (!msg) return true; // unknown errors default to recoverable
+  const nonRecoverablePatterns = [
+    "invalid parameter",
+    "invalid argument",
+    "parameter error",
+    "argument error",
+    "permission denied",
+    "access denied",
+    "forbidden",
+    "not found",
+    "already",
+    "insufficient",
+    "not enough",
+    "limit reached",
+    "seed_not_found",
+    "no_empty",
+  ];
+  for (let i = 0; i < nonRecoverablePatterns.length; i += 1) {
+    if (msg.includes(nonRecoverablePatterns[i])) return false;
+  }
+  return true;
+}
+
 async function callGameCtlWithRecovery(session, callGameCtl, pathName, args, opts) {
   const callOpts = opts && typeof opts === "object" ? opts : {};
+  const maxRecoveryRetries = callOpts.maxRecoveryRetries != null ? Number(callOpts.maxRecoveryRetries) : 3;
+  const recoveryBaseDelayMs = callOpts.recoveryBaseDelayMs != null ? Number(callOpts.recoveryBaseDelayMs) : 1000;
   const reconnectOpts = {
     waitAfter: callOpts.reconnectWaitAfter,
     waitForRecovered: callOpts.reconnectWaitForRecovered,
@@ -58,28 +87,44 @@ async function callGameCtlWithRecovery(session, callGameCtl, pathName, args, opt
 
   await autoReconnectIfNeeded(session, callGameCtl, reconnectOpts);
 
-  try {
-    return await callGameCtl(session, pathName, args);
-  } catch (error) {
-    const recover = await autoReconnectIfNeeded(session, callGameCtl, reconnectOpts);
-    if (recover && recover.handled && callOpts.retryOnReconnect !== false) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= maxRecoveryRetries; attempt += 1) {
+    try {
       return await callGameCtl(session, pathName, args);
-    }
-    throw error;
-  }
-}
+    } catch (error) {
+      lastError = error;
 
-function normalizeText(value) {
-  return value == null ? "" : String(value).trim();
+      // If not recoverable, throw immediately
+      if (!isRecoverableError(error)) {
+        throw error;
+      }
+
+      // No more retries left
+      if (attempt >= maxRecoveryRetries) {
+        break;
+      }
+
+      // Exponential backoff delay: recoveryBaseDelayMs * 2^attempt
+      const delayMs = Math.min(recoveryBaseDelayMs * Math.pow(2, attempt), 30000);
+      console.debug(
+        `[callGameCtlWithRecovery] attempt ${attempt + 1}/${maxRecoveryRetries} failed for ${pathName},` +
+        ` retrying in ${delayMs}ms: ${toErrorMessage(error)}`
+      );
+      await wait(delayMs);
+
+      // Try to reconnect before next attempt
+      const recover = await autoReconnectIfNeeded(session, callGameCtl, reconnectOpts);
+      if (recover && recover.handled && callOpts.retryOnReconnect !== false) {
+        // Reconnection handled, continue to next iteration which will retry the call
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 function normalizeMatchText(value) {
   return normalizeText(value).replace(/\s+/g, "").toLowerCase();
-}
-
-function toPositiveNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 }
 
 function getPriorityId(item) {
@@ -219,6 +264,53 @@ function collectEmptyLandIds(status) {
   return out;
 }
 
+/**
+ * 根据施肥策略筛选可施肥的地块ID列表
+ * @param {object} status - getFarmStatus 返回的状态
+ * @param {object} opts - { fertilizeStrategy, fertilizeMinLevel }
+ *   - "all": 所有非空地块
+ *   - "growing": 仅生长中地块（默认）
+ *   - "empty": 仅空地
+ *   - "low_level": 地块等级 <= fertilizeMinLevel 的非空地块
+ * @returns {number[]}
+ */
+function collectFertilizableLandIds(status, opts) {
+  const grids = Array.isArray(status && status.grids) ? status.grids : [];
+  const strategy = (opts && opts.fertilizeStrategy) || "growing";
+  const minLevel = (opts && opts.fertilizeMinLevel) || 0;
+  const seen = new Set();
+  const out = [];
+
+  for (let i = 0; i < grids.length; i += 1) {
+    const grid = grids[i];
+    const landId = toPositiveNumber(grid && grid.landId);
+    if (landId == null || seen.has(landId)) continue;
+
+    let match = false;
+    if (strategy === "all") {
+      // 所有非空地块都施肥
+      match = grid.stageKind !== "empty";
+    } else if (strategy === "growing") {
+      // 仅生长中地块
+      match = grid.stageKind === "growing";
+    } else if (strategy === "empty") {
+      // 仅空地
+      match = grid.stageKind === "empty";
+    } else if (strategy === "low_level") {
+      // 地块等级低于阈值的非空地块
+      const gridLevel = toPositiveNumber(grid.level) || 0;
+      match = grid.stageKind !== "empty" && gridLevel <= minLevel;
+    }
+
+    if (match) {
+      seen.add(landId);
+      out.push(landId);
+    }
+  }
+
+  return out;
+}
+
 async function getFarmOwnership(session, callGameCtl, opts) {
   return await callGameCtlWithRecovery(session, callGameCtl, "gameCtl.getFarmOwnership", [withSilent(opts)], opts);
 }
@@ -318,6 +410,27 @@ async function eraseGrassLands(session, callGameCtl, landIds, opts) {
   ], opts);
 }
 
+// ---------------------------------------------------------------------------
+// Fertilize functions (#12)
+// ---------------------------------------------------------------------------
+
+async function fertilizeSingleLand(session, callGameCtl, landId, opts) {
+  const fertilizerId = opts && opts.fertilizerId != null ? opts.fertilizerId : 2;
+  return await callGameCtlWithRecovery(session, callGameCtl, "gameCtl.fertilizeSingleLand", [
+    landId,
+    fertilizerId,
+    withSilent(opts),
+  ], opts);
+}
+
+async function fertilizeLands(session, callGameCtl, landIds, opts) {
+  const fertilizerId = opts && opts.fertilizerId != null ? opts.fertilizerId : 2;
+  return await callGameCtlWithRecovery(session, callGameCtl, "gameCtl.fertilizeLands", [
+    { land_ids: Array.isArray(landIds) ? landIds : [landIds], fertilizer_id: fertilizerId },
+    withSilent(opts, { waitForResult: false }),
+  ], opts);
+}
+
 function getActionableLandIds(status, key) {
   const landIds = status && status.landIds && status.landIds[key];
   const list = Array.isArray(landIds) ? landIds : [];
@@ -349,6 +462,12 @@ function getCareActionExecutor(key) {
     return {
       op: "KILL_BUG",
       invoke: killBugLands,
+    };
+  }
+  if (key === "fertilize") {
+    return {
+      op: "FERTILIZE",
+      invoke: fertilizeLands,
     };
   }
   throw new Error("unknown care action key: " + key);
@@ -548,7 +667,9 @@ async function collectSupplementalHarvestCandidates(session, callGameCtl, status
       multiLandOnly: true,
     });
     addLandIds(runtimeCandidatePayload && runtimeCandidatePayload.landIds);
-  } catch (_) {}
+  } catch (error) {
+    console.debug("[collectSupplementalHarvestCandidates] getHarvestablePlantLandIds failed:", toErrorMessage(error));
+  }
 
   return {
     landIds: out,
@@ -766,6 +887,33 @@ function resolvePrioritySeedTarget(catalog, source, mode) {
   return { candidate: null, reason: "no_seed_available" };
 }
 
+// ---------------------------------------------------------------------------
+// Special collect helper (#20) - extracted to avoid duplication
+// ---------------------------------------------------------------------------
+
+async function tryRunSpecialCollect(session, callGameCtl, opts) {
+  const includeSpecialCollect = !opts || opts.includeSpecialCollect !== false;
+  if (!includeSpecialCollect) return null;
+
+  const actionWaitMs = Math.max(0, Number(opts && opts.actionWaitMs) || 0);
+  const stopOnError = !!(opts && opts.stopOnError);
+
+  try {
+    const specialCollect = await runSupplementalMatureEffectHarvest(session, callGameCtl, {
+      actionWaitMs,
+      timeoutMs: opts && opts.timeoutMs,
+      pollMs: opts && opts.pollMs,
+      stopOnError,
+    });
+    return specialCollect;
+  } catch (error) {
+    return {
+      ok: false,
+      error: toErrorMessage(error),
+    };
+  }
+}
+
 async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
   const actionWaitMs = Math.max(0, Number(opts && opts.actionWaitMs) || 0);
   const useBatchCareExpCheck = !!(opts && opts.stopCareWhenNoExp);
@@ -778,6 +926,10 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
   const includeWater = !opts || opts.includeWater !== false;
   const includeEraseGrass = !opts || opts.includeEraseGrass !== false;
   const includeKillBug = !opts || opts.includeKillBug !== false;
+  const includeFertilize = !!(opts && opts.includeFertilize);
+  const fertilizerId = opts && opts.fertilizerId != null ? opts.fertilizerId : 2;
+  const fertilizeStrategy = (opts && opts.fertilizeStrategy) || "growing";
+  const fertilizeMinLevel = opts && opts.fertilizeMinLevel != null ? opts.fertilizeMinLevel : 0;
   const specs = [];
 
   if (includeCollect) specs.push({ key: "collect", op: "HARVEST" });
@@ -785,6 +937,7 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
     if (includeEraseGrass) specs.push({ key: "eraseGrass", op: "ERASE_GRASS" });
     if (includeKillBug) specs.push({ key: "killBug", op: "KILL_BUG" });
     if (includeWater) specs.push({ key: "water", op: "WATER" });
+    // 施肥不走通用 specs，单独处理
   }
 
   const actions = [];
@@ -797,27 +950,15 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
     const spec = specs[i];
     const beforeCount = getWorkCount(currentStatus, spec.key);
     if (beforeCount <= 0) {
-      if (spec.key === "collect" && (!opts || opts.includeSpecialCollect !== false)) {
-        try {
-          specialCollect = await runSupplementalMatureEffectHarvest(session, callGameCtl, {
-            actionWaitMs,
-            timeoutMs: opts && opts.timeoutMs,
-            pollMs: opts && opts.pollMs,
-            stopOnError: !!(opts && opts.stopOnError),
+      if (spec.key === "collect") {
+        specialCollect = await tryRunSpecialCollect(session, callGameCtl, opts);
+        if (specialCollect && specialCollect.candidateCount > 0) {
+          currentStatus = await getFarmStatus(session, callGameCtl, {
+            includeGrids: false,
+            includeLandIds: useBatchCareExpCheck,
           });
-          if (specialCollect.candidateCount > 0) {
-            currentStatus = await getFarmStatus(session, callGameCtl, {
-              includeGrids: false,
-              includeLandIds: useBatchCareExpCheck,
-            });
-          }
-        } catch (error) {
-          specialCollect = {
-            ok: false,
-            error: toErrorMessage(error),
-          };
-          if (opts && opts.stopOnError) break;
         }
+        if (specialCollect && !specialCollect.ok && opts && opts.stopOnError) break;
       }
       continue;
     }
@@ -869,27 +1010,15 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
         trigger,
       });
 
-      if (spec.key === "collect" && (!opts || opts.includeSpecialCollect !== false)) {
-        try {
-          specialCollect = await runSupplementalMatureEffectHarvest(session, callGameCtl, {
-            actionWaitMs,
-            timeoutMs: opts && opts.timeoutMs,
-            pollMs: opts && opts.pollMs,
-            stopOnError: !!(opts && opts.stopOnError),
+      if (spec.key === "collect") {
+        specialCollect = await tryRunSpecialCollect(session, callGameCtl, opts);
+        if (specialCollect && specialCollect.candidateCount > 0) {
+          currentStatus = await getFarmStatus(session, callGameCtl, {
+            includeGrids: false,
+            includeLandIds: useBatchCareExpCheck,
           });
-          if (specialCollect.candidateCount > 0) {
-            currentStatus = await getFarmStatus(session, callGameCtl, {
-              includeGrids: false,
-              includeLandIds: useBatchCareExpCheck,
-            });
-          }
-        } catch (error) {
-          specialCollect = {
-            ok: false,
-            error: toErrorMessage(error),
-          };
-          if (opts && opts.stopOnError) break;
         }
+        if (specialCollect && !specialCollect.ok && opts && opts.stopOnError) break;
       }
     } catch (error) {
       actions.push({
@@ -900,29 +1029,91 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
         error: toErrorMessage(error),
       });
 
-      if (spec.key === "collect" && (!opts || opts.includeSpecialCollect !== false) && (!opts || !opts.stopOnError)) {
-        try {
-          specialCollect = await runSupplementalMatureEffectHarvest(session, callGameCtl, {
-            actionWaitMs,
-            timeoutMs: opts && opts.timeoutMs,
-            pollMs: opts && opts.pollMs,
-            stopOnError: false,
+      if (spec.key === "collect" && (!opts || !opts.stopOnError)) {
+        specialCollect = await tryRunSpecialCollect(session, callGameCtl, {
+          ...opts,
+          stopOnError: false,
+        });
+        if (specialCollect && specialCollect.candidateCount > 0) {
+          currentStatus = await getFarmStatus(session, callGameCtl, {
+            includeGrids: false,
+            includeLandIds: useBatchCareExpCheck,
           });
-          if (specialCollect.candidateCount > 0) {
-            currentStatus = await getFarmStatus(session, callGameCtl, {
-              includeGrids: false,
-              includeLandIds: useBatchCareExpCheck,
-            });
-          }
-        } catch (supplementError) {
-          specialCollect = {
-            ok: false,
-            error: toErrorMessage(supplementError),
-          };
         }
       }
 
       if (opts && opts.stopOnError) break;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 施肥：在浇水之后、收获之后单独执行
+  // 使用策略筛选地块 + 传入 fertilizerId
+  // -------------------------------------------------------------------------
+  let fertilizeAction = null;
+  if (farmType === "own" && includeFertilize) {
+    try {
+      // 刷新状态以获取最新 grids 数据
+      currentStatus = await getFarmStatus(session, callGameCtl, {
+        includeGrids: true,
+        includeLandIds: false,
+      });
+      const fertilizableLandIds = collectFertilizableLandIds(currentStatus, {
+        fertilizeStrategy,
+        fertilizeMinLevel,
+      });
+      if (fertilizableLandIds.length > 0) {
+        const fertResult = await fertilizeLands(session, callGameCtl, fertilizableLandIds, {
+          fertilizerId,
+          timeoutMs: opts && opts.timeoutMs,
+          stopOnError: !!(opts && opts.stopOnError),
+        });
+        const afterStatus = await getFarmStatus(session, callGameCtl, {
+          includeGrids: false,
+          includeLandIds: false,
+        });
+        currentStatus = afterStatus || currentStatus;
+        fertilizeAction = {
+          ok: !!(fertResult && fertResult.ok),
+          key: "fertilize",
+          op: "FERTILIZE",
+          beforeCount: fertilizableLandIds.length,
+          afterCount: 0, // 施肥后地块数不易计算
+          landCount: fertilizableLandIds.length,
+          fertilizerId,
+          fertilizeStrategy,
+          result: fertResult,
+        };
+        actions.push(fertilizeAction);
+      } else {
+        fertilizeAction = {
+          ok: true,
+          key: "fertilize",
+          op: "FERTILIZE",
+          beforeCount: 0,
+          afterCount: 0,
+          landCount: 0,
+          fertilizerId,
+          fertilizeStrategy,
+          reason: "no_fertilizable_lands",
+        };
+        actions.push(fertilizeAction);
+      }
+    } catch (error) {
+      fertilizeAction = {
+        ok: false,
+        key: "fertilize",
+        op: "FERTILIZE",
+        beforeCount: 0,
+        afterCount: 0,
+        fertilizerId,
+        fertilizeStrategy,
+        error: toErrorMessage(error),
+      };
+      actions.push(fertilizeAction);
+      if (opts && opts.stopOnError) {
+        // 不 break，因为这是最后的动作了
+      }
     }
   }
 
@@ -935,6 +1126,8 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
     after: summarizeFarmStatus(currentStatus),
     actions,
     specialCollect,
+    fertilizeStrategy: includeFertilize ? fertilizeStrategy : null,
+    fertilizerId: includeFertilize ? fertilizerId : null,
   };
 }
 
@@ -1104,13 +1297,100 @@ async function autoPlant(session, callGameCtl, opts) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Smart replant (#13) - verify and replant empty lands after autoPlant
+// ---------------------------------------------------------------------------
+
+async function runSmartReplant(session, callGameCtl, initialPlantResult, opts) {
+  const rawOpts = opts && typeof opts === "object" ? opts : {};
+  const maxReplantAttempts = 2;
+  const replantWaitMs = 2000;
+  const replantAttempts = [];
+
+  // If initial plant was fully successful, no replant needed
+  if (initialPlantResult && initialPlantResult.ok && initialPlantResult.emptyCount > 0) {
+    // Check if all lands were actually planted
+    const status = await getFarmStatus(session, callGameCtl, {
+      includeGrids: true,
+      includeLandIds: false,
+    });
+    const remainingEmpty = collectEmptyLandIds(status);
+    if (remainingEmpty.length === 0) {
+      return { needed: false, attempts: [], finalEmptyCount: 0 };
+    }
+  } else if (!initialPlantResult || !initialPlantResult.ok) {
+    // Initial plant failed, check for empty lands
+  } else {
+    return { needed: false, attempts: [], finalEmptyCount: 0 };
+  }
+
+  for (let attempt = 0; attempt < maxReplantAttempts; attempt += 1) {
+    await wait(replantWaitMs);
+
+    const status = await getFarmStatus(session, callGameCtl, {
+      includeGrids: true,
+      includeLandIds: false,
+    });
+    const emptyLandIds = collectEmptyLandIds(status);
+
+    if (emptyLandIds.length === 0) {
+      return { needed: true, attempts: replantAttempts, finalEmptyCount: 0 };
+    }
+
+    try {
+      const replantResult = await autoPlant(session, callGameCtl, {
+        autoPlantMode: rawOpts.autoPlantMode,
+        autoPlantSource: rawOpts.autoPlantSource,
+        autoFarmPlantSelectedSeedKey: rawOpts.autoPlantSelectedSeedKey,
+        actionWaitMs: rawOpts.actionWaitMs,
+        buyWaitMs: rawOpts.buyWaitMs,
+        timeoutMs: rawOpts.timeoutMs,
+        pollMs: rawOpts.pollMs,
+        intervalMs: rawOpts.intervalMs,
+        stopOnError: !!rawOpts.stopOnError,
+      });
+      replantAttempts.push({
+        attempt: attempt + 1,
+        emptyCount: emptyLandIds.length,
+        ok: !!(replantResult && replantResult.ok),
+        result: replantResult,
+      });
+
+      if (replantResult && replantResult.ok && replantResult.action === "no_empty_lands") {
+        return { needed: true, attempts: replantAttempts, finalEmptyCount: 0 };
+      }
+    } catch (error) {
+      replantAttempts.push({
+        attempt: attempt + 1,
+        emptyCount: emptyLandIds.length,
+        ok: false,
+        error: toErrorMessage(error),
+      });
+    }
+  }
+
+  // Final check
+  try {
+    const finalStatus = await getFarmStatus(session, callGameCtl, {
+      includeGrids: true,
+      includeLandIds: false,
+    });
+    const finalEmptyCount = collectEmptyLandIds(finalStatus).length;
+    return { needed: true, attempts: replantAttempts, finalEmptyCount };
+  } catch (error) {
+    console.debug("[runSmartReplant] final status check failed:", toErrorMessage(error));
+    return { needed: true, attempts: replantAttempts, finalEmptyCount: -1 };
+  }
+}
+
 async function runOwnFarmAutomation(session, callGameCtl, opts) {
   const enterWaitMs = Math.max(0, Number(opts && opts.enterWaitMs) || 0);
   const actionWaitMs = Math.max(0, Number(opts && opts.actionWaitMs) || 0);
   let ownership = null;
   try {
     ownership = await getFarmOwnership(session, callGameCtl, { allowWeakUi: true });
-  } catch (_) {
+  } catch (error) {
+    console.debug("[runOwnFarmAutomation] getFarmOwnership failed:", toErrorMessage(error));
     ownership = null;
   }
 
@@ -1127,6 +1407,7 @@ async function runOwnFarmAutomation(session, callGameCtl, opts) {
     includeWater: !opts || opts.includeWater !== false,
     includeEraseGrass: !opts || opts.includeEraseGrass !== false,
     includeKillBug: !opts || opts.includeKillBug !== false,
+    includeFertilize: !!(opts && opts.includeFertilize),
     includeSpecialCollect: !opts || opts.includeSpecialCollect !== false,
     stopCareWhenNoExp: !!(opts && opts.stopCareWhenNoExp),
     actionWaitMs: opts && opts.actionWaitMs,
@@ -1140,13 +1421,28 @@ async function runOwnFarmAutomation(session, callGameCtl, opts) {
 
   const plantMode = normalizeAutoPlantMode(opts && opts.autoPlantMode);
   let plantResult = null;
+  let replantResult = null;
   if (plantMode !== "none") {
     try {
       if (actionWaitMs > 0) {
         await wait(actionWaitMs);
       }
-      
-        plantResult = await autoPlant(session, callGameCtl, {
+
+      plantResult = await autoPlant(session, callGameCtl, {
+        autoPlantMode: plantMode,
+        autoPlantSource: opts && opts.autoPlantSource,
+        autoFarmPlantSelectedSeedKey: opts && opts.autoPlantSelectedSeedKey,
+        actionWaitMs: opts && opts.actionWaitMs,
+        buyWaitMs: opts && opts.buyWaitMs,
+        timeoutMs: opts && opts.timeoutMs,
+        pollMs: opts && opts.pollMs,
+        intervalMs: opts && opts.intervalMs,
+        stopOnError: !!(opts && opts.stopOnError),
+      });
+
+      // Smart replant (#13): if plant was not fully successful, verify and replant
+      if (plantResult && !plantResult.ok) {
+        replantResult = await runSmartReplant(session, callGameCtl, plantResult, {
           autoPlantMode: plantMode,
           autoPlantSource: opts && opts.autoPlantSource,
           autoFarmPlantSelectedSeedKey: opts && opts.autoPlantSelectedSeedKey,
@@ -1157,7 +1453,7 @@ async function runOwnFarmAutomation(session, callGameCtl, opts) {
           intervalMs: opts && opts.intervalMs,
           stopOnError: !!(opts && opts.stopOnError),
         });
-      
+      }
     } catch (error) {
       plantResult = { ok: false, error: toErrorMessage(error) };
     }
@@ -1168,6 +1464,7 @@ async function runOwnFarmAutomation(session, callGameCtl, opts) {
     enterOwn,
     tasks,
     plantResult,
+    replantResult,
   };
 }
 
@@ -1183,6 +1480,10 @@ function getFriendPendingActionCount(friend, opts) {
   return total;
 }
 
+// ---------------------------------------------------------------------------
+// Friend farm strategy (#14)
+// ---------------------------------------------------------------------------
+
 async function runCurrentFriendFarmTasks(session, callGameCtl, statusBefore, opts) {
   const actionWaitMs = Math.max(0, Number(opts && opts.actionWaitMs) || 0);
   const harvestWaitMs = Math.min(actionWaitMs, 280);
@@ -1193,6 +1494,7 @@ async function runCurrentFriendFarmTasks(session, callGameCtl, statusBefore, opt
   const includeSpecialCollect = !opts || opts.includeSpecialCollect !== false;
   const detectCareExp = !!(opts && opts.stopCareWhenNoExp);
   const needLandIds = includeWater || includeEraseGrass || includeKillBug;
+  const friendStrategy = normalizeFriendStrategy(opts && opts.friendStrategy);
   const actions = [];
   let currentStatus = statusBefore;
   let specialCollect = null;
@@ -1228,82 +1530,135 @@ async function runCurrentFriendFarmTasks(session, callGameCtl, statusBefore, opt
     }
   }
 
-  const collectBefore = getWorkCount(currentStatus, "collect");
-  if (includeCollect && collectBefore > 0) {
-    try {
-      const trigger = await triggerOneClickOperation(session, callGameCtl, "HARVEST", {
-        includeBefore: false,
-        includeAfter: false,
+  // help_first strategy: do help actions (water/eraseGrass/killBug) before steal (collect)
+  if (friendStrategy === "help_first" || friendStrategy === "help_only") {
+    const careSpecs = [];
+    if (includeEraseGrass) careSpecs.push({ key: "eraseGrass", ...getCareActionExecutor("eraseGrass") });
+    if (includeKillBug) careSpecs.push({ key: "killBug", ...getCareActionExecutor("killBug") });
+    if (includeWater) careSpecs.push({ key: "water", ...getCareActionExecutor("water") });
+
+    for (let i = 0; i < careSpecs.length; i += 1) {
+      const careSpec = careSpecs[i];
+      const beforeCount = getWorkCount(currentStatus, careSpec.key);
+      if (beforeCount <= 0) continue;
+
+      const careAction = await runBatchLandCareTask(session, callGameCtl, careSpec, currentStatus, {
+        ...opts,
+        detectExp: detectCareExp,
       });
-      if (harvestWaitMs > 0) {
-        await wait(harvestWaitMs);
-      }
-      await refreshStatus();
-      const collectAfter = getWorkCount(currentStatus, "collect");
-      actions.push({
-        ok: true,
-        key: "collect",
-        op: "HARVEST",
-        beforeCount: collectBefore,
-        afterCount: collectAfter,
-        trigger,
-      });
-    } catch (error) {
-      actions.push({
-        ok: false,
-        key: "collect",
-        op: "HARVEST",
-        beforeCount: collectBefore,
-        error: toErrorMessage(error),
-      });
-      if (opts && opts.stopOnError) {
-        return {
-          farmType: "friend",
-          careMode: detectCareExp ? "batch_land_exp_check" : "batch_land",
-          careExpLimitReached,
-          careExpLimitInfo,
-          before: summarizeFarmStatus(statusBefore),
-          after: summarizeFarmStatus(currentStatus),
-          actions,
-          specialCollect,
+      currentStatus = careAction.nextStatus || currentStatus;
+      const { nextStatus, ...actionEntry } = careAction;
+      actions.push(actionEntry);
+
+      if (detectCareExp && careAction.expLimitReached) {
+        careExpLimitReached = true;
+        careExpLimitInfo = {
+          key: careSpec.key,
+          op: careSpec.op,
+          landId: careAction.expLimitLandId,
+          result: careAction.expLimitResult,
         };
+        break;
+      }
+      if (!careAction.ok && opts && opts.stopOnError) {
+        break;
       }
     }
-    await runSpecialCollect(!!(opts && opts.stopOnError));
-  } else if (includeCollect && includeSpecialCollect) {
-    await runSpecialCollect(!!(opts && opts.stopOnError));
+
+    // If exp limit reached during help, skip steal
+    if (careExpLimitReached && friendStrategy === "help_first") {
+      // Still try collect since help_first means both, but skip if exp limit
+    }
   }
 
-  const careSpecs = [];
-  if (includeEraseGrass) careSpecs.push({ key: "eraseGrass", ...getCareActionExecutor("eraseGrass") });
-  if (includeKillBug) careSpecs.push({ key: "killBug", ...getCareActionExecutor("killBug") });
-  if (includeWater) careSpecs.push({ key: "water", ...getCareActionExecutor("water") });
+  // Steal (collect) phase - skip for help_only strategy
+  const shouldSteal = friendStrategy !== "help_only";
 
-  for (let i = 0; i < careSpecs.length; i += 1) {
-    const careSpec = careSpecs[i];
-    const beforeCount = getWorkCount(currentStatus, careSpec.key);
-    if (beforeCount <= 0) continue;
-
-    const careAction = await runBatchLandCareTask(session, callGameCtl, careSpec, currentStatus, {
-      ...opts,
-      detectExp: detectCareExp,
-    });
-    currentStatus = careAction.nextStatus || currentStatus;
-    const { nextStatus, ...actionEntry } = careAction;
-    actions.push(actionEntry);
-
-    if (detectCareExp && careAction.expLimitReached) {
-      careExpLimitReached = true;
-      careExpLimitInfo = {
-        key: careSpec.key,
-        op: careSpec.op,
-        landId: careAction.expLimitLandId,
-        result: careAction.expLimitResult,
-      };
-      break;
+  if (shouldSteal) {
+    const collectBefore = getWorkCount(currentStatus, "collect");
+    if (includeCollect && collectBefore > 0) {
+      try {
+        const trigger = await triggerOneClickOperation(session, callGameCtl, "HARVEST", {
+          includeBefore: false,
+          includeAfter: false,
+        });
+        if (harvestWaitMs > 0) {
+          await wait(harvestWaitMs);
+        }
+        await refreshStatus();
+        const collectAfter = getWorkCount(currentStatus, "collect");
+        actions.push({
+          ok: true,
+          key: "collect",
+          op: "HARVEST",
+          beforeCount: collectBefore,
+          afterCount: collectAfter,
+          trigger,
+        });
+      } catch (error) {
+        actions.push({
+          ok: false,
+          key: "collect",
+          op: "HARVEST",
+          beforeCount: collectBefore,
+          error: toErrorMessage(error),
+        });
+        if (opts && opts.stopOnError) {
+          return {
+            farmType: "friend",
+            careMode: detectCareExp ? "batch_land_exp_check" : "batch_land",
+            careExpLimitReached,
+            careExpLimitInfo,
+            before: summarizeFarmStatus(statusBefore),
+            after: summarizeFarmStatus(currentStatus),
+            actions,
+            specialCollect,
+          };
+        }
+      }
+      await runSpecialCollect(!!(opts && opts.stopOnError));
+    } else if (includeCollect && includeSpecialCollect) {
+      await runSpecialCollect(!!(opts && opts.stopOnError));
     }
-    if (!careAction.ok && opts && opts.stopOnError) {
-      break;
+  }
+
+  // steal_and_help (default) or steal_only: do help actions after steal
+  // steal_only skips help actions entirely
+  if (friendStrategy === "steal_and_help" || friendStrategy === "steal_only") {
+    // steal_only: skip all care actions (already handled by only running collect above)
+    if (friendStrategy === "steal_and_help") {
+      const careSpecs = [];
+      if (includeEraseGrass) careSpecs.push({ key: "eraseGrass", ...getCareActionExecutor("eraseGrass") });
+      if (includeKillBug) careSpecs.push({ key: "killBug", ...getCareActionExecutor("killBug") });
+      if (includeWater) careSpecs.push({ key: "water", ...getCareActionExecutor("water") });
+
+      for (let i = 0; i < careSpecs.length; i += 1) {
+        const careSpec = careSpecs[i];
+        const beforeCount = getWorkCount(currentStatus, careSpec.key);
+        if (beforeCount <= 0) continue;
+
+        const careAction = await runBatchLandCareTask(session, callGameCtl, careSpec, currentStatus, {
+          ...opts,
+          detectExp: detectCareExp,
+        });
+        currentStatus = careAction.nextStatus || currentStatus;
+        const { nextStatus, ...actionEntry } = careAction;
+        actions.push(actionEntry);
+
+        if (detectCareExp && careAction.expLimitReached) {
+          careExpLimitReached = true;
+          careExpLimitInfo = {
+            key: careSpec.key,
+            op: careSpec.op,
+            landId: careAction.expLimitLandId,
+            result: careAction.expLimitResult,
+          };
+          break;
+        }
+        if (!careAction.ok && opts && opts.stopOnError) {
+          break;
+        }
+      }
     }
   }
 
@@ -1327,6 +1682,14 @@ async function runFriendStealAutomation(session, callGameCtl, opts) {
   const includeWater = !opts || opts.includeWater !== false;
   const includeEraseGrass = !opts || opts.includeEraseGrass !== false;
   const includeKillBug = !opts || opts.includeKillBug !== false;
+  const friendStrategy = normalizeFriendStrategy(opts && opts.friendStrategy);
+
+  // Adjust include flags based on strategy
+  const effectiveIncludeCollect = friendStrategy === "help_only" ? false : includeCollect;
+  const effectiveIncludeWater = friendStrategy === "steal_only" ? false : includeWater;
+  const effectiveIncludeEraseGrass = friendStrategy === "steal_only" ? false : includeEraseGrass;
+  const effectiveIncludeKillBug = friendStrategy === "steal_only" ? false : includeKillBug;
+
   const friendData = await getFriendList(session, callGameCtl, {
     refresh: !opts || opts.refresh !== false,
     sort: true,
@@ -1341,22 +1704,22 @@ async function runFriendStealAutomation(session, callGameCtl, opts) {
   }) > 0).length;
   const candidates = friendList
     .filter((item) => getFriendPendingActionCount(item, {
-      includeCollect,
-      includeWater,
-      includeEraseGrass,
-      includeKillBug,
+      includeCollect: effectiveIncludeCollect,
+      includeWater: effectiveIncludeWater,
+      includeEraseGrass: effectiveIncludeEraseGrass,
+      includeKillBug: effectiveIncludeKillBug,
     }) > 0)
     .sort((a, b) => {
       const diff = getFriendPendingActionCount(b, {
-        includeCollect,
-        includeWater,
-        includeEraseGrass,
-        includeKillBug,
+        includeCollect: effectiveIncludeCollect,
+        includeWater: effectiveIncludeWater,
+        includeEraseGrass: effectiveIncludeEraseGrass,
+        includeKillBug: effectiveIncludeKillBug,
       }) - getFriendPendingActionCount(a, {
-        includeCollect,
-        includeWater,
-        includeEraseGrass,
-        includeKillBug,
+        includeCollect: effectiveIncludeCollect,
+        includeWater: effectiveIncludeWater,
+        includeEraseGrass: effectiveIncludeEraseGrass,
+        includeKillBug: effectiveIncludeKillBug,
       });
       if (diff !== 0) return diff;
       return (Number(a && a.rank) || 0) - (Number(b && b.rank) || 0);
@@ -1370,10 +1733,10 @@ async function runFriendStealAutomation(session, callGameCtl, opts) {
     const friend = candidates[i];
     const allowCare = !careExpLimitReached;
     const visitActionCount = getFriendPendingActionCount(friend, {
-      includeCollect,
-      includeWater: allowCare && includeWater,
-      includeEraseGrass: allowCare && includeEraseGrass,
-      includeKillBug: allowCare && includeKillBug,
+      includeCollect: effectiveIncludeCollect,
+      includeWater: allowCare && effectiveIncludeWater,
+      includeEraseGrass: allowCare && effectiveIncludeEraseGrass,
+      includeKillBug: allowCare && effectiveIncludeKillBug,
     });
     if (visitActionCount <= 0) {
       continue;
@@ -1385,7 +1748,7 @@ async function runFriendStealAutomation(session, callGameCtl, opts) {
       });
       const beforeStatus = await getFarmStatus(session, callGameCtl, {
         includeGrids: false,
-        includeLandIds: (allowCare && includeWater) || (allowCare && includeEraseGrass) || (allowCare && includeKillBug),
+        includeLandIds: (allowCare && effectiveIncludeWater) || (allowCare && effectiveIncludeEraseGrass) || (allowCare && effectiveIncludeKillBug),
       });
       if (beforeStatus.farmType !== "friend") {
         visits.push({
@@ -1399,11 +1762,12 @@ async function runFriendStealAutomation(session, callGameCtl, opts) {
       }
 
       const tasks = await runCurrentFriendFarmTasks(session, callGameCtl, beforeStatus, {
-        includeCollect,
-        includeWater: allowCare && includeWater,
-        includeEraseGrass: allowCare && includeEraseGrass,
-        includeKillBug: allowCare && includeKillBug,
+        includeCollect: effectiveIncludeCollect,
+        includeWater: allowCare && effectiveIncludeWater,
+        includeEraseGrass: allowCare && effectiveIncludeEraseGrass,
+        includeKillBug: allowCare && effectiveIncludeKillBug,
         includeSpecialCollect,
+        friendStrategy,
         stopCareWhenNoExp: allowCare && !!(opts && opts.stopCareWhenNoExp),
         actionWaitMs: opts && opts.actionWaitMs,
         timeoutMs: opts && opts.timeoutMs,
@@ -1477,6 +1841,7 @@ async function runFriendStealAutomation(session, callGameCtl, opts) {
     totalCandidates: Number(friendData && friendData.count) || friendList.length,
     actionableCandidates: candidates.length,
     stealableCandidates,
+    friendStrategy,
     careExpLimitReached,
     careExpLimitInfo,
     visits,
@@ -1502,7 +1867,8 @@ async function runAutoFarmCycle({ session, callGameCtl, options }) {
 
   try {
     payload.initialOwnership = await getFarmOwnership(session, callGameCtl, { allowWeakUi: true });
-  } catch (_) {
+  } catch (error) {
+    console.debug("[runAutoFarmCycle] initial getFarmOwnership failed:", toErrorMessage(error));
     payload.initialOwnership = null;
   }
 
@@ -1512,6 +1878,7 @@ async function runAutoFarmCycle({ session, callGameCtl, options }) {
       includeWater: opts.includeWater !== false,
       includeEraseGrass: opts.includeEraseGrass !== false,
       includeKillBug: opts.includeKillBug !== false,
+      includeFertilize: !!opts.includeFertilize,
       stopCareWhenNoExp: !!opts.stopCareWhenNoExp,
       autoPlantMode: opts.autoPlantMode || "none",
       autoPlantSource: opts.autoPlantSource || "auto",
@@ -1537,6 +1904,7 @@ async function runAutoFarmCycle({ session, callGameCtl, options }) {
       includeWater: opts.includeWater !== false,
       includeEraseGrass: opts.includeEraseGrass !== false,
       includeKillBug: opts.includeKillBug !== false,
+      friendStrategy: opts.friendStrategy || "steal_and_help",
       stopCareWhenNoExp: !!opts.stopCareWhenNoExp,
       refresh: opts.refreshFriendList !== false,
       maxFriends: opts.maxFriends,
@@ -1555,7 +1923,8 @@ async function runAutoFarmCycle({ session, callGameCtl, options }) {
 
   try {
     payload.finalOwnership = await getFarmOwnership(session, callGameCtl, { allowWeakUi: true });
-  } catch (_) {
+  } catch (error) {
+    console.debug("[runAutoFarmCycle] final getFarmOwnership failed:", toErrorMessage(error));
     payload.finalOwnership = null;
   }
 
