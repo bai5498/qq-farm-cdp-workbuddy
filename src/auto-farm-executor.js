@@ -9,6 +9,22 @@ const {
 
 const { sleep: wait, toErrorMessage, normalizeText, toPositiveNumber } = require("./utils");
 
+/**
+ * 尝试关闭游戏中的弹框/遮罩层（如升级弹窗）。
+ * 静默执行，不抛异常，不影响主流程。
+ * @param {Function} callGameCtl - WS 调用函数
+ */
+async function tryDismissOverlay(callGameCtl) {
+  try {
+    const result = await callGameCtl("gameCtl.dismissActiveOverlay", [{ silent: true }]);
+    if (result && result.ok) {
+      console.log("[tryDismissOverlay] 弹框已关闭:", result.action ? result.action.type : "unknown");
+    }
+  } catch (e) {
+    // 静默忽略，不影响主流程
+  }
+}
+
 function summarizeFarmStatus(status) {
   if (!status || typeof status !== "object") return null;
   return {
@@ -971,6 +987,8 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
         };
         const batchAction = await runBatchLandCareTask(session, callGameCtl, careSpec, currentStatus, opts);
         currentStatus = batchAction.nextStatus || currentStatus;
+        // 批量操作后尝试关闭升级弹窗
+        await tryDismissOverlay(callGameCtl);
         const { nextStatus, ...actionEntry } = batchAction;
         actions.push(actionEntry);
         if (batchAction.expLimitReached) {
@@ -993,6 +1011,8 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
         includeBefore: false,
         includeAfter: false,
       });
+      // 收获/浇水/除草/杀虫后尝试关闭升级弹窗
+      await tryDismissOverlay(callGameCtl);
       if (actionWaitMs > 0) {
         await wait(actionWaitMs);
       }
@@ -1068,6 +1088,8 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
           timeoutMs: opts && opts.timeoutMs,
           stopOnError: !!(opts && opts.stopOnError),
         });
+        // 施肥后尝试关闭升级弹窗
+        await tryDismissOverlay(callGameCtl);
         const afterStatus = await getFarmStatus(session, callGameCtl, {
           includeGrids: false,
           includeLandIds: false,
@@ -1547,6 +1569,8 @@ async function runCurrentFriendFarmTasks(session, callGameCtl, statusBefore, opt
         detectExp: detectCareExp,
       });
       currentStatus = careAction.nextStatus || currentStatus;
+      // 好友帮忙操作后尝试关闭升级弹窗
+      await tryDismissOverlay(callGameCtl);
       const { nextStatus, ...actionEntry } = careAction;
       actions.push(actionEntry);
 
@@ -1582,6 +1606,8 @@ async function runCurrentFriendFarmTasks(session, callGameCtl, statusBefore, opt
           includeBefore: false,
           includeAfter: false,
         });
+        // 好友农场收获后尝试关闭升级弹窗
+        await tryDismissOverlay(callGameCtl);
         if (harvestWaitMs > 0) {
           await wait(harvestWaitMs);
         }
