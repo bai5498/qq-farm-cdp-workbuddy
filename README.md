@@ -242,6 +242,28 @@ npm run qq:patch
 
 ## 修复日志
 
+### 2026-06-02 功能修复（1 项）
+
+#### 🟠 High
+
+| Bug | 文件 | 描述 |
+|-----|------|------|
+| 升级弹窗阻塞自动化流程 | auto-farm-executor.js | 收获后等级提升弹出升级弹窗，`BlockInputEvents` 遮罩层阻止所有后续游戏操作，导致 `getFriendList` 超时、自动化停止 |
+
+**修复方案：**
+
+新增 `tryDismissOverlay()` 辅助函数，调用已有的 `gameCtl.dismissActiveOverlay` 评分检测+关闭机制。静默执行，不抛异常，无弹窗时什么都不做。
+
+在以下 5 个关键操作点插入弹窗检测：
+
+| 调用点 | 说明 |
+|--------|------|
+| 一键操作后 | 收获/浇水/除草/杀虫后 |
+| 批量操作后 | `runBatchLandCareTask`（自己农场） |
+| 施肥操作后 | `fertilizeLands` 后 |
+| 好友收获后 | 偷菜后 |
+| 好友帮忙后 | `runBatchLandCareTask`（好友农场） |
+
 ### 2026-05-27 Bug 修复（18 项）
 
 #### 🔴 Critical
@@ -285,24 +307,4 @@ npm run qq:patch
 - 开始/停止自动化按钮颜色根据运行状态自动切换
 - 底部区域改为修复日志展示
 
-### 2026-06-02 功能修复（1 项）
 
-#### 🟠 High
-
-| Bug | 文件 | 描述 |
-|-----|------|------|
-| 升级弹窗阻塞自动化流程 | auto-farm-executor.js | 收获后等级提升弹出升级弹窗，`BlockInputEvents` 遮罩层阻止所有后续游戏操作，导致 `getFriendList` 超时、自动化停止 |
-
-**修复方案：**
-
-新增 `tryDismissOverlay()` 辅助函数，调用已有的 `gameCtl.dismissActiveOverlay` 评分检测+关闭机制。静默执行，不抛异常，无弹窗时什么都不做。
-
-在以下 5 个关键操作点插入弹窗检测：
-
-| 调用点 | 说明 |
-|--------|------|
-| 一键操作后 | 收获/浇水/除草/杀虫后 |
-| 批量操作后 | `runBatchLandCareTask`（自己农场） |
-| 施肥操作后 | `fertilizeLands` 后 |
-| 好友收获后 | 偷菜后 |
-| 好友帮忙后 | `runBatchLandCareTask`（好友农场） |
